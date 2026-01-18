@@ -341,15 +341,19 @@ impl ApplicationHandler for App {
                 if !self.minimized {
                     self.render_frame();
                 }
+
+                // Drive continuous animation even while the window is being interacted with.
+                // (Relying only on about_to_wait can stall during certain OS modal loops.)
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
             }
             _ => {}
         }
     }
     
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(window) = &self.window {
-            window.request_redraw();
-        }
+        // No-op: redraws are chained from RedrawRequested.
     }
 }
 

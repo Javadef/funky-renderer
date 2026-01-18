@@ -290,6 +290,12 @@ impl VulkanRenderer {
                 format: vk::Format::R32G32B32_SFLOAT,
                 offset: 12,
             },
+            vk::VertexInputAttributeDescription {
+                binding: 0,
+                location: 2,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: 24,
+            },
         ];
         
         let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default()
@@ -626,6 +632,7 @@ impl Drop for VulkanRenderer {
 pub struct Vertex {
     pub pos: [f32; 3],
     pub color: [f32; 3],
+    pub normal: [f32; 3],
 }
 
 #[repr(C)]

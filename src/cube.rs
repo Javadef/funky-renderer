@@ -19,35 +19,35 @@ impl CubeRenderer {
         // Pastel colors matching reference scene
         let vertices = [
             // Front face (pale green)
-            Vertex { pos: [-0.5, -0.5,  0.5], color: [0.5, 0.7, 0.5] },
-            Vertex { pos: [ 0.5, -0.5,  0.5], color: [0.5, 0.7, 0.5] },
-            Vertex { pos: [ 0.5,  0.5,  0.5], color: [0.5, 0.7, 0.5] },
-            Vertex { pos: [-0.5,  0.5,  0.5], color: [0.5, 0.7, 0.5] },
+            Vertex { pos: [-0.5, -0.5,  0.5], color: [0.5, 0.7, 0.5], normal: [0.0, 0.0, 1.0] },
+            Vertex { pos: [ 0.5, -0.5,  0.5], color: [0.5, 0.7, 0.5], normal: [0.0, 0.0, 1.0] },
+            Vertex { pos: [ 0.5,  0.5,  0.5], color: [0.5, 0.7, 0.5], normal: [0.0, 0.0, 1.0] },
+            Vertex { pos: [-0.5,  0.5,  0.5], color: [0.5, 0.7, 0.5], normal: [0.0, 0.0, 1.0] },
             // Back face (olive/khaki)
-            Vertex { pos: [-0.5, -0.5, -0.5], color: [0.6, 0.6, 0.3] },
-            Vertex { pos: [-0.5,  0.5, -0.5], color: [0.6, 0.6, 0.3] },
-            Vertex { pos: [ 0.5,  0.5, -0.5], color: [0.6, 0.6, 0.3] },
-            Vertex { pos: [ 0.5, -0.5, -0.5], color: [0.6, 0.6, 0.3] },
+            Vertex { pos: [-0.5, -0.5, -0.5], color: [0.6, 0.6, 0.3], normal: [0.0, 0.0, -1.0] },
+            Vertex { pos: [-0.5,  0.5, -0.5], color: [0.6, 0.6, 0.3], normal: [0.0, 0.0, -1.0] },
+            Vertex { pos: [ 0.5,  0.5, -0.5], color: [0.6, 0.6, 0.3], normal: [0.0, 0.0, -1.0] },
+            Vertex { pos: [ 0.5, -0.5, -0.5], color: [0.6, 0.6, 0.3], normal: [0.0, 0.0, -1.0] },
             // Top face (light cyan/aqua)
-            Vertex { pos: [-0.5,  0.5, -0.5], color: [0.7, 0.9, 0.9] },
-            Vertex { pos: [-0.5,  0.5,  0.5], color: [0.7, 0.9, 0.9] },
-            Vertex { pos: [ 0.5,  0.5,  0.5], color: [0.7, 0.9, 0.9] },
-            Vertex { pos: [ 0.5,  0.5, -0.5], color: [0.7, 0.9, 0.9] },
+            Vertex { pos: [-0.5,  0.5, -0.5], color: [0.7, 0.9, 0.9], normal: [0.0, 1.0, 0.0] },
+            Vertex { pos: [-0.5,  0.5,  0.5], color: [0.7, 0.9, 0.9], normal: [0.0, 1.0, 0.0] },
+            Vertex { pos: [ 0.5,  0.5,  0.5], color: [0.7, 0.9, 0.9], normal: [0.0, 1.0, 0.0] },
+            Vertex { pos: [ 0.5,  0.5, -0.5], color: [0.7, 0.9, 0.9], normal: [0.0, 1.0, 0.0] },
             // Bottom face (muted green)
-            Vertex { pos: [-0.5, -0.5, -0.5], color: [0.4, 0.55, 0.4] },
-            Vertex { pos: [ 0.5, -0.5, -0.5], color: [0.4, 0.55, 0.4] },
-            Vertex { pos: [ 0.5, -0.5,  0.5], color: [0.4, 0.55, 0.4] },
-            Vertex { pos: [-0.5, -0.5,  0.5], color: [0.4, 0.55, 0.4] },
+            Vertex { pos: [-0.5, -0.5, -0.5], color: [0.4, 0.55, 0.4], normal: [0.0, -1.0, 0.0] },
+            Vertex { pos: [ 0.5, -0.5, -0.5], color: [0.4, 0.55, 0.4], normal: [0.0, -1.0, 0.0] },
+            Vertex { pos: [ 0.5, -0.5,  0.5], color: [0.4, 0.55, 0.4], normal: [0.0, -1.0, 0.0] },
+            Vertex { pos: [-0.5, -0.5,  0.5], color: [0.4, 0.55, 0.4], normal: [0.0, -1.0, 0.0] },
             // Right face (pale yellow)
-            Vertex { pos: [ 0.5, -0.5, -0.5], color: [0.9, 0.9, 0.7] },
-            Vertex { pos: [ 0.5,  0.5, -0.5], color: [0.9, 0.9, 0.7] },
-            Vertex { pos: [ 0.5,  0.5,  0.5], color: [0.9, 0.9, 0.7] },
-            Vertex { pos: [ 0.5, -0.5,  0.5], color: [0.9, 0.9, 0.7] },
+            Vertex { pos: [ 0.5, -0.5, -0.5], color: [0.9, 0.9, 0.7], normal: [1.0, 0.0, 0.0] },
+            Vertex { pos: [ 0.5,  0.5, -0.5], color: [0.9, 0.9, 0.7], normal: [1.0, 0.0, 0.0] },
+            Vertex { pos: [ 0.5,  0.5,  0.5], color: [0.9, 0.9, 0.7], normal: [1.0, 0.0, 0.0] },
+            Vertex { pos: [ 0.5, -0.5,  0.5], color: [0.9, 0.9, 0.7], normal: [1.0, 0.0, 0.0] },
             // Left face (forest green)
-            Vertex { pos: [-0.5, -0.5, -0.5], color: [0.35, 0.55, 0.35] },
-            Vertex { pos: [-0.5, -0.5,  0.5], color: [0.35, 0.55, 0.35] },
-            Vertex { pos: [-0.5,  0.5,  0.5], color: [0.35, 0.55, 0.35] },
-            Vertex { pos: [-0.5,  0.5, -0.5], color: [0.35, 0.55, 0.35] },
+            Vertex { pos: [-0.5, -0.5, -0.5], color: [0.35, 0.55, 0.35], normal: [-1.0, 0.0, 0.0] },
+            Vertex { pos: [-0.5, -0.5,  0.5], color: [0.35, 0.55, 0.35], normal: [-1.0, 0.0, 0.0] },
+            Vertex { pos: [-0.5,  0.5,  0.5], color: [0.35, 0.55, 0.35], normal: [-1.0, 0.0, 0.0] },
+            Vertex { pos: [-0.5,  0.5, -0.5], color: [0.35, 0.55, 0.35], normal: [-1.0, 0.0, 0.0] },
         ];
         
         // Indices for 12 triangles (6 faces * 2 triangles)

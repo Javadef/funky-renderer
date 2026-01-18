@@ -32,3 +32,11 @@ sysinfo = "0.33"
 [[bin]]
 name = "funkyrenderer"
 path = "src/main.rs"
+
+# Graphics apps tend to feel very slow in unoptimized debug builds.
+# This keeps fast iteration while greatly improving FPS.
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 2

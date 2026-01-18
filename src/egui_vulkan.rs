@@ -43,6 +43,11 @@ pub struct EguiVulkanRenderer {
     index_buffer: vk::Buffer,
     index_buffer_memory: vk::DeviceMemory,
     index_buffer_size: usize,
+
+    // Scratch buffers to avoid per-frame allocations
+    scratch_vertices: Vec<EguiVertex>,
+    scratch_indices: Vec<u32>,
+    scratch_mesh_infos: Vec<(usize, usize, egui::Rect)>,
 }
 
 impl EguiVulkanRenderer {
@@ -265,6 +270,10 @@ impl EguiVulkanRenderer {
                 index_buffer,
                 index_buffer_memory,
                 index_buffer_size: 512 * 1024,
+
+                scratch_vertices: Vec::with_capacity(8 * 1024),
+                scratch_indices: Vec::with_capacity(16 * 1024),
+                scratch_mesh_infos: Vec::with_capacity(256),
             }
         }
     }
@@ -297,17 +306,17 @@ impl EguiVulkanRenderer {
         }
         
         unsafe {
-            let mut all_vertices: Vec<EguiVertex> = Vec::new();
-            let mut all_indices: Vec<u32> = Vec::new();
-            let mut mesh_infos: Vec<(usize, usize, egui::Rect)> = Vec::new();
+            self.scratch_vertices.clear();
+            self.scratch_indices.clear();
+            self.scratch_mesh_infos.clear();
             
             for clipped in &clipped_meshes {
                 if let egui::epaint::Primitive::Mesh(mesh) = &clipped.primitive {
-                    let vertex_offset = all_vertices.len();
-                    let index_offset = all_indices.len();
+                    let vertex_offset = self.scratch_vertices.len();
+                    let index_offset = self.scratch_indices.len();
                     
                     for v in &mesh.vertices {
-                        all_vertices.push(EguiVertex {
+                        self.scratch_vertices.push(EguiVertex {
                             pos: [v.pos.x, v.pos.y],
                             uv: [v.uv.x, v.uv.y],
                             color: v.color.to_array(),
@@ -315,26 +324,27 @@ impl EguiVulkanRenderer {
                     }
                     
                     for idx in &mesh.indices {
-                        all_indices.push(*idx + vertex_offset as u32);
+                        self.scratch_indices.push(*idx + vertex_offset as u32);
                     }
                     
-                    mesh_infos.push((index_offset, mesh.indices.len(), clipped.clip_rect));
+                    self.scratch_mesh_infos
+                        .push((index_offset, mesh.indices.len(), clipped.clip_rect));
                 }
             }
             
-            if all_vertices.is_empty() {
+            if self.scratch_vertices.is_empty() {
                 return;
             }
             
             // Upload data
             let ptr = device.map_memory(self.vertex_buffer_memory, 0, 
-                (all_vertices.len() * size_of::<EguiVertex>()) as u64, vk::MemoryMapFlags::empty()).unwrap() as *mut EguiVertex;
-            std::ptr::copy_nonoverlapping(all_vertices.as_ptr(), ptr, all_vertices.len());
+                (self.scratch_vertices.len() * size_of::<EguiVertex>()) as u64, vk::MemoryMapFlags::empty()).unwrap() as *mut EguiVertex;
+            std::ptr::copy_nonoverlapping(self.scratch_vertices.as_ptr(), ptr, self.scratch_vertices.len());
             device.unmap_memory(self.vertex_buffer_memory);
             
             let ptr = device.map_memory(self.index_buffer_memory, 0,
-                (all_indices.len() * size_of::<u32>()) as u64, vk::MemoryMapFlags::empty()).unwrap() as *mut u32;
-            std::ptr::copy_nonoverlapping(all_indices.as_ptr(), ptr, all_indices.len());
+                (self.scratch_indices.len() * size_of::<u32>()) as u64, vk::MemoryMapFlags::empty()).unwrap() as *mut u32;
+            std::ptr::copy_nonoverlapping(self.scratch_indices.as_ptr(), ptr, self.scratch_indices.len());
             device.unmap_memory(self.index_buffer_memory);
             
             // Render
@@ -358,7 +368,7 @@ impl EguiVulkanRenderer {
             device.cmd_bind_vertex_buffers(command_buffer, 0, &[self.vertex_buffer], &[0]);
             device.cmd_bind_index_buffer(command_buffer, self.index_buffer, 0, vk::IndexType::UINT32);
             
-            for (index_offset, index_count, clip_rect) in mesh_infos {
+            for (index_offset, index_count, clip_rect) in self.scratch_mesh_infos.drain(..) {
                 let min_x = (clip_rect.min.x * pixels_per_point).max(0.0) as i32;
                 let min_y = (clip_rect.min.y * pixels_per_point).max(0.0) as i32;
                 let max_x = (clip_rect.max.x * pixels_per_point).min(screen_width as f32) as u32;
