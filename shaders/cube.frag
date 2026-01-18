@@ -20,11 +20,14 @@ void main() {
     // Simple diffuse lighting
     float diff = max(dot(normal, lightDir), 0.0);
     
-    // Ambient + diffuse
-    vec3 ambient = 0.3 * fragColor;
-    vec3 diffuse = 0.7 * diff * fragColor;
+    // Bright ambient + diffuse
+    vec3 ambient = 0.5 * fragColor;
+    vec3 diffuse = 0.6 * diff * fragColor;
     
-    vec3 result = ambient + diffuse;
+    // Add slight highlight
+    float highlight = pow(max(diff, 0.0), 2.0) * 0.2;
+    
+    vec3 result = ambient + diffuse + vec3(highlight);
     
     outColor = vec4(result, 1.0);
 }
