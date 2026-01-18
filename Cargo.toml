@@ -3,36 +3,32 @@ name = "funkyrenderer"
 version = "0.1.0"
 edition = "2021"
 
-[features]
-default = ["standalone"]
-standalone = []
-bevy_plugin = ["bevy", "bevy_egui", "sysinfo"]
-
 [dependencies]
 # Vulkan with ash 0.38 API (uses .default() instead of .builder())
 ash = { version = "0.38", features = ["linked"] }
 ash-window = "0.13"
 gpu-allocator = { version = "0.28", default-features = false, features = ["vulkan", "std"] }
-winit = "0.30"
 raw-window-handle = "0.6"
 glam = "0.29"
 parking_lot = "0.12"
 rayon = "1.11"
 num_cpus = "1.16"
 
-# Bevy integration (optional)
-bevy = { version = "0.15", optional = true, default-features = false, features = ["bevy_winit", "bevy_render", "bevy_core_pipeline", "bevy_pbr", "tonemapping_luts", "x11"] }
-bevy_egui = { version = "0.31", optional = true }
+# Bevy ECS only (no renderer)
+bevy_ecs = "0.15"
+bevy_app = "0.15"
+bevy_time = "0.15"
+
+# Window (we manage this ourselves)
+winit = "0.30"
+
+# egui for debug UI (direct Vulkan rendering)
+egui = "0.29"
+egui-winit = "0.29"
 
 # System info
-sysinfo = { version = "0.33", optional = true }
+sysinfo = "0.33"
 
 [[bin]]
 name = "funkyrenderer"
 path = "src/main.rs"
-required-features = ["standalone"]
-
-[[bin]]
-name = "funkyrenderer_bevy"
-path = "src/bevy_main.rs"
-required-features = ["bevy_plugin"]

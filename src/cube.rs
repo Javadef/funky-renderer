@@ -203,6 +203,51 @@ impl CubeRenderer {
         Ok(())
     }
     
+    pub unsafe fn draw(
+        &self,
+        renderer: &VulkanRenderer,
+        command_buffer: vk::CommandBuffer,
+        frame_index: usize,
+    ) -> Result<(), vk::Result> {
+        renderer.device.cmd_bind_pipeline(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            renderer.graphics_pipeline,
+        );
+        
+        let viewport = vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: renderer.swapchain_extent.width as f32,
+            height: renderer.swapchain_extent.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        renderer.device.cmd_set_viewport(command_buffer, 0, &[viewport]);
+        
+        let scissor = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: renderer.swapchain_extent,
+        };
+        renderer.device.cmd_set_scissor(command_buffer, 0, &[scissor]);
+        
+        renderer.device.cmd_bind_vertex_buffers(command_buffer, 0, &[self.vertex_buffer], &[0]);
+        renderer.device.cmd_bind_index_buffer(command_buffer, self.index_buffer, 0, vk::IndexType::UINT16);
+        
+        renderer.device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            renderer.pipeline_layout,
+            0,
+            &[renderer.descriptor_sets[frame_index]],
+            &[],
+        );
+        
+        renderer.device.cmd_draw_indexed(command_buffer, self.index_count, 1, 0, 0, 0);
+        
+        Ok(())
+    }
+    
     pub unsafe fn record_commands(
         &self,
         renderer: &VulkanRenderer,

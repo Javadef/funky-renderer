@@ -38,9 +38,11 @@ pub struct VulkanRenderer {
     pub descriptor_sets: Vec<vk::DescriptorSet>,
     pub graphics_queue_family_index: u32,
     pub framebuffer_resized: bool,
+    pub gpu_name: String,
+    pub vulkan_version: String,
 }
 
-pub const MAX_FRAMES_IN_FLIGHT: usize = 2;
+pub const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
 impl VulkanRenderer {
     pub unsafe fn new(window: &winit::window::Window) -> Result<Self, Box<dyn std::error::Error>> {
@@ -84,7 +86,12 @@ impl VulkanRenderer {
         let props = instance.get_physical_device_properties(physical_device);
         let device_name = std::ffi::CStr::from_ptr(props.device_name.as_ptr())
             .to_string_lossy();
-        println!("🎮 GPU: {}", device_name);
+        let gpu_name = device_name.to_string();
+        let vulkan_version = format!("{}.{}.{}", 
+            vk::api_version_major(props.api_version),
+            vk::api_version_minor(props.api_version),
+            vk::api_version_patch(props.api_version));
+        println!("🎮 GPU: {} (Vulkan {})", gpu_name, vulkan_version);
         
         // Find queue families
         let queue_families = instance.get_physical_device_queue_family_properties(physical_device);
@@ -157,7 +164,7 @@ impl VulkanRenderer {
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(surface_capabilities.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-            .present_mode(vk::PresentModeKHR::MAILBOX);  // No VSync
+            .present_mode(vk::PresentModeKHR::IMMEDIATE);  // Max FPS - no vsync at all
         
         let swapchain_fn = ash::khr::swapchain::Device::new(&instance, &device);
         let swapchain = swapchain_fn.create_swapchain(&swapchain_create_info, None)?;
@@ -440,6 +447,8 @@ impl VulkanRenderer {
             descriptor_sets,
             graphics_queue_family_index,
             framebuffer_resized: false,
+            gpu_name,
+            vulkan_version,
         })
     }
     
@@ -499,7 +508,7 @@ impl VulkanRenderer {
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(surface_capabilities.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-            .present_mode(vk::PresentModeKHR::MAILBOX)  // No VSync
+            .present_mode(vk::PresentModeKHR::IMMEDIATE)  // Max FPS - no vsync at all
             .old_swapchain(old_swapchain);
         
         self.swapchain = self.swapchain_fn.create_swapchain(&swapchain_create_info, None)?;

@@ -33,4 +33,24 @@ fn main() {
         Ok(s) if s.success() => println!("cargo:warning=Fragment shader compiled"),
         _ => println!("cargo:warning=Fragment shader compile failed - using existing .spv"),
     }
+    
+    // Compile egui vertex shader
+    let status = Command::new(&glslc)
+        .args(&["shaders/egui.vert", "-o", "shaders/egui.vert.spv"])
+        .status();
+    
+    match status {
+        Ok(s) if s.success() => println!("cargo:warning=egui vertex shader compiled"),
+        _ => println!("cargo:warning=egui vertex shader compile failed"),
+    }
+    
+    // Compile egui fragment shader
+    let status = Command::new(&glslc)
+        .args(&["shaders/egui.frag", "-o", "shaders/egui.frag.spv"])
+        .status();
+    
+    match status {
+        Ok(s) if s.success() => println!("cargo:warning=egui fragment shader compiled"),
+        _ => println!("cargo:warning=egui fragment shader compile failed"),
+    }
 }
