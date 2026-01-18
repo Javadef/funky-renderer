@@ -132,7 +132,8 @@ fn update_performance_stats(mut stats: ResMut<PerformanceStats>) {
     let now = Instant::now();
     let last_update = stats.last_fps_update.get_or_insert(now);
     let elapsed = now.duration_since(*last_update);
-    if elapsed.as_millis() >= 100 {
+    // 500ms window for smoother FPS display
+    if elapsed.as_millis() >= 500 {
         stats.fps = stats.frame_count as f64 / elapsed.as_secs_f64();
         stats.frame_time_ms = 1000.0 / stats.fps;
         stats.frame_count = 0;

@@ -48,6 +48,10 @@ pub struct EguiVulkanRenderer {
     scratch_vertices: Vec<EguiVertex>,
     scratch_indices: Vec<u32>,
     scratch_mesh_infos: Vec<(usize, usize, egui::Rect)>,
+
+    // Persistent mapped pointers (avoid map/unmap overhead)
+    vertex_mapped_ptr: *mut EguiVertex,
+    index_mapped_ptr: *mut u32,
 }
 
 impl EguiVulkanRenderer {
@@ -254,6 +258,14 @@ impl EguiVulkanRenderer {
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
             );
             
+            // Persistently map the buffers (HOST_COHERENT so no flush needed)
+            let vertex_mapped_ptr = device.map_memory(
+                vertex_buffer_memory, 0, 1024 * 1024, vk::MemoryMapFlags::empty()
+            ).unwrap() as *mut EguiVertex;
+            let index_mapped_ptr = device.map_memory(
+                index_buffer_memory, 0, 512 * 1024, vk::MemoryMapFlags::empty()
+            ).unwrap() as *mut u32;
+
             Self {
                 pipeline_layout,
                 pipeline,
@@ -274,6 +286,9 @@ impl EguiVulkanRenderer {
                 scratch_vertices: Vec::with_capacity(8 * 1024),
                 scratch_indices: Vec::with_capacity(16 * 1024),
                 scratch_mesh_infos: Vec::with_capacity(256),
+
+                vertex_mapped_ptr,
+                index_mapped_ptr,
             }
         }
     }
@@ -336,16 +351,17 @@ impl EguiVulkanRenderer {
                 return;
             }
             
-            // Upload data
-            let ptr = device.map_memory(self.vertex_buffer_memory, 0, 
-                (self.scratch_vertices.len() * size_of::<EguiVertex>()) as u64, vk::MemoryMapFlags::empty()).unwrap() as *mut EguiVertex;
-            std::ptr::copy_nonoverlapping(self.scratch_vertices.as_ptr(), ptr, self.scratch_vertices.len());
-            device.unmap_memory(self.vertex_buffer_memory);
-            
-            let ptr = device.map_memory(self.index_buffer_memory, 0,
-                (self.scratch_indices.len() * size_of::<u32>()) as u64, vk::MemoryMapFlags::empty()).unwrap() as *mut u32;
-            std::ptr::copy_nonoverlapping(self.scratch_indices.as_ptr(), ptr, self.scratch_indices.len());
-            device.unmap_memory(self.index_buffer_memory);
+            // Upload data via persistent mapped pointers (no map/unmap overhead)
+            std::ptr::copy_nonoverlapping(
+                self.scratch_vertices.as_ptr(),
+                self.vertex_mapped_ptr,
+                self.scratch_vertices.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                self.scratch_indices.as_ptr(),
+                self.index_mapped_ptr,
+                self.scratch_indices.len(),
+            );
             
             // Render
             device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, self.pipeline);

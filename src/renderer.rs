@@ -79,9 +79,26 @@ impl VulkanRenderer {
         )?;
         let surface_fn = ash::khr::surface::Instance::new(&entry, &instance);
         
-        // Pick physical device
+        // Pick physical device - prefer discrete GPU over integrated
         let physical_devices = instance.enumerate_physical_devices()?;
-        let physical_device = physical_devices[0];
+        
+        // Sort: discrete GPUs first, then integrated, then others
+        let physical_device = physical_devices
+            .iter()
+            .map(|&pd| {
+                let props = instance.get_physical_device_properties(pd);
+                let priority = match props.device_type {
+                    vk::PhysicalDeviceType::DISCRETE_GPU => 0,   // Best - dedicated GPU like 1650 Ti
+                    vk::PhysicalDeviceType::INTEGRATED_GPU => 1, // Fallback - Intel UHD
+                    vk::PhysicalDeviceType::VIRTUAL_GPU => 2,
+                    vk::PhysicalDeviceType::CPU => 3,
+                    _ => 4,
+                };
+                (pd, priority, props)
+            })
+            .min_by_key(|(_, priority, _)| *priority)
+            .map(|(pd, _, _)| pd)
+            .ok_or("No Vulkan-capable GPU found")?;
         
         let props = instance.get_physical_device_properties(physical_device);
         let device_name = std::ffi::CStr::from_ptr(props.device_name.as_ptr())
@@ -145,6 +162,20 @@ impl VulkanRenderer {
             .get_physical_device_surface_formats(physical_device, surface)?;
         let surface_format = surface_formats[0];
         
+        // Check available present modes and pick best for max FPS
+        let present_modes = surface_fn
+            .get_physical_device_surface_present_modes(physical_device, surface)?;
+        let present_mode = if present_modes.contains(&vk::PresentModeKHR::IMMEDIATE) {
+            println!("✓ Using IMMEDIATE present mode (no vsync)");
+            vk::PresentModeKHR::IMMEDIATE
+        } else if present_modes.contains(&vk::PresentModeKHR::MAILBOX) {
+            println!("✓ Using MAILBOX present mode (triple buffering)");
+            vk::PresentModeKHR::MAILBOX
+        } else {
+            println!("⚠ Falling back to FIFO (vsync enabled by driver)");
+            vk::PresentModeKHR::FIFO
+        };
+        
         let swapchain_extent = surface_capabilities.current_extent;
         let max_images = if surface_capabilities.max_image_count == 0 {
             u32::MAX
@@ -164,7 +195,7 @@ impl VulkanRenderer {
             .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
             .pre_transform(surface_capabilities.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-            .present_mode(vk::PresentModeKHR::IMMEDIATE);  // Max FPS - no vsync at all
+            .present_mode(present_mode);
         
         let swapchain_fn = ash::khr::swapchain::Device::new(&instance, &device);
         let swapchain = swapchain_fn.create_swapchain(&swapchain_create_info, None)?;
