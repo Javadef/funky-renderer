@@ -20,12 +20,12 @@ void main() {
     // Simple diffuse lighting
     float diff = max(dot(normal, lightDir), 0.0);
     
-    // Bright ambient + diffuse
-    vec3 ambient = 0.5 * fragColor;
-    vec3 diffuse = 0.6 * diff * fragColor;
+    // Softer pastel lighting - higher ambient for softer look
+    vec3 ambient = 0.65 * fragColor;
+    vec3 diffuse = 0.45 * diff * fragColor;
     
-    // Add slight highlight
-    float highlight = pow(max(diff, 0.0), 2.0) * 0.2;
+    // Soft highlight
+    float highlight = pow(max(diff, 0.0), 3.0) * 0.15;
     
     vec3 result = ambient + diffuse + vec3(highlight);
     

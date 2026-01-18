@@ -1,3 +1,7 @@
+//! Funky Renderer - Standalone Vulkan Application
+//! 
+//! Run with: cargo run --release
+
 mod renderer;
 mod cube;
 mod multithreading;

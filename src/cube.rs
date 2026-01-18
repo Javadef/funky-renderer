@@ -16,37 +16,38 @@ pub struct CubeRenderer {
 impl CubeRenderer {
     pub unsafe fn new(renderer: &VulkanRenderer) -> Result<Self, Box<dyn std::error::Error>> {
         // Create cube vertices - 24 vertices for proper per-face colors
+        // Pastel colors matching reference scene
         let vertices = [
-            // Front face (red)
-            Vertex { pos: [-0.5, -0.5,  0.5], color: [1.0, 0.3, 0.3] },
-            Vertex { pos: [ 0.5, -0.5,  0.5], color: [1.0, 0.3, 0.3] },
-            Vertex { pos: [ 0.5,  0.5,  0.5], color: [1.0, 0.3, 0.3] },
-            Vertex { pos: [-0.5,  0.5,  0.5], color: [1.0, 0.3, 0.3] },
-            // Back face (green)
-            Vertex { pos: [-0.5, -0.5, -0.5], color: [0.3, 1.0, 0.3] },
-            Vertex { pos: [-0.5,  0.5, -0.5], color: [0.3, 1.0, 0.3] },
-            Vertex { pos: [ 0.5,  0.5, -0.5], color: [0.3, 1.0, 0.3] },
-            Vertex { pos: [ 0.5, -0.5, -0.5], color: [0.3, 1.0, 0.3] },
-            // Top face (blue)
-            Vertex { pos: [-0.5,  0.5, -0.5], color: [0.3, 0.3, 1.0] },
-            Vertex { pos: [-0.5,  0.5,  0.5], color: [0.3, 0.3, 1.0] },
-            Vertex { pos: [ 0.5,  0.5,  0.5], color: [0.3, 0.3, 1.0] },
-            Vertex { pos: [ 0.5,  0.5, -0.5], color: [0.3, 0.3, 1.0] },
-            // Bottom face (yellow)
-            Vertex { pos: [-0.5, -0.5, -0.5], color: [1.0, 1.0, 0.3] },
-            Vertex { pos: [ 0.5, -0.5, -0.5], color: [1.0, 1.0, 0.3] },
-            Vertex { pos: [ 0.5, -0.5,  0.5], color: [1.0, 1.0, 0.3] },
-            Vertex { pos: [-0.5, -0.5,  0.5], color: [1.0, 1.0, 0.3] },
-            // Right face (magenta)
-            Vertex { pos: [ 0.5, -0.5, -0.5], color: [1.0, 0.3, 1.0] },
-            Vertex { pos: [ 0.5,  0.5, -0.5], color: [1.0, 0.3, 1.0] },
-            Vertex { pos: [ 0.5,  0.5,  0.5], color: [1.0, 0.3, 1.0] },
-            Vertex { pos: [ 0.5, -0.5,  0.5], color: [1.0, 0.3, 1.0] },
-            // Left face (cyan)
-            Vertex { pos: [-0.5, -0.5, -0.5], color: [0.3, 1.0, 1.0] },
-            Vertex { pos: [-0.5, -0.5,  0.5], color: [0.3, 1.0, 1.0] },
-            Vertex { pos: [-0.5,  0.5,  0.5], color: [0.3, 1.0, 1.0] },
-            Vertex { pos: [-0.5,  0.5, -0.5], color: [0.3, 1.0, 1.0] },
+            // Front face (pale green)
+            Vertex { pos: [-0.5, -0.5,  0.5], color: [0.5, 0.7, 0.5] },
+            Vertex { pos: [ 0.5, -0.5,  0.5], color: [0.5, 0.7, 0.5] },
+            Vertex { pos: [ 0.5,  0.5,  0.5], color: [0.5, 0.7, 0.5] },
+            Vertex { pos: [-0.5,  0.5,  0.5], color: [0.5, 0.7, 0.5] },
+            // Back face (olive/khaki)
+            Vertex { pos: [-0.5, -0.5, -0.5], color: [0.6, 0.6, 0.3] },
+            Vertex { pos: [-0.5,  0.5, -0.5], color: [0.6, 0.6, 0.3] },
+            Vertex { pos: [ 0.5,  0.5, -0.5], color: [0.6, 0.6, 0.3] },
+            Vertex { pos: [ 0.5, -0.5, -0.5], color: [0.6, 0.6, 0.3] },
+            // Top face (light cyan/aqua)
+            Vertex { pos: [-0.5,  0.5, -0.5], color: [0.7, 0.9, 0.9] },
+            Vertex { pos: [-0.5,  0.5,  0.5], color: [0.7, 0.9, 0.9] },
+            Vertex { pos: [ 0.5,  0.5,  0.5], color: [0.7, 0.9, 0.9] },
+            Vertex { pos: [ 0.5,  0.5, -0.5], color: [0.7, 0.9, 0.9] },
+            // Bottom face (muted green)
+            Vertex { pos: [-0.5, -0.5, -0.5], color: [0.4, 0.55, 0.4] },
+            Vertex { pos: [ 0.5, -0.5, -0.5], color: [0.4, 0.55, 0.4] },
+            Vertex { pos: [ 0.5, -0.5,  0.5], color: [0.4, 0.55, 0.4] },
+            Vertex { pos: [-0.5, -0.5,  0.5], color: [0.4, 0.55, 0.4] },
+            // Right face (pale yellow)
+            Vertex { pos: [ 0.5, -0.5, -0.5], color: [0.9, 0.9, 0.7] },
+            Vertex { pos: [ 0.5,  0.5, -0.5], color: [0.9, 0.9, 0.7] },
+            Vertex { pos: [ 0.5,  0.5,  0.5], color: [0.9, 0.9, 0.7] },
+            Vertex { pos: [ 0.5, -0.5,  0.5], color: [0.9, 0.9, 0.7] },
+            // Left face (forest green)
+            Vertex { pos: [-0.5, -0.5, -0.5], color: [0.35, 0.55, 0.35] },
+            Vertex { pos: [-0.5, -0.5,  0.5], color: [0.35, 0.55, 0.35] },
+            Vertex { pos: [-0.5,  0.5,  0.5], color: [0.35, 0.55, 0.35] },
+            Vertex { pos: [-0.5,  0.5, -0.5], color: [0.35, 0.55, 0.35] },
         ];
         
         // Indices for 12 triangles (6 faces * 2 triangles)
@@ -214,7 +215,7 @@ impl CubeRenderer {
         
         let clear_values = [vk::ClearValue {
             color: vk::ClearColorValue {
-                float32: [0.05, 0.05, 0.1, 1.0],
+                float32: [0.39, 0.58, 0.93, 1.0],  // Cornflower blue background
             },
         }];
         
