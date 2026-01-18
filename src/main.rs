@@ -499,6 +499,23 @@ impl App {
                     };
                     
                     let full_output = egui_int.build_ui(window, &ui_data);
+
+                    // Keep Vulkan font atlas in sync with egui (required for correct text on some machines/DPI settings)
+                    if !full_output.textures_delta.set.is_empty() {
+                        renderer
+                            .device
+                            .wait_for_fences(&renderer.in_flight_fences, true, u64::MAX)
+                            .unwrap();
+                    }
+                    egui_vk.update_textures(
+                        &renderer.device,
+                        &renderer.instance,
+                        renderer.physical_device,
+                        renderer.graphics_queue,
+                        renderer.graphics_queue_family_index,
+                        &full_output.textures_delta,
+                    );
+
                     let clipped_primitives = egui_int.ctx.tessellate(
                         full_output.shapes,
                         full_output.pixels_per_point,

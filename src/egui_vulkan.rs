@@ -195,7 +195,10 @@ impl EguiVulkanRenderer {
             let (font_image_vk, font_image_memory, font_image_view, font_sampler) = {
                 let font_image = ctx.fonts(|fonts| {
                     let image = fonts.image();
-                    let pixels: Vec<u8> = image.srgba_pixels(None).flat_map(|c| c.to_array()).collect();
+                    let pixels: Vec<u8> = image.pixels.iter().flat_map(|&r| {
+                        let byte = (r * 255.0) as u8;
+                        [255u8, 255u8, 255u8, byte]
+                    }).collect();
                     (image.width() as u32, image.height() as u32, pixels)
                 });
                 
@@ -386,17 +389,40 @@ fn create_font_texture(
     queue: vk::Queue,
 ) -> (vk::Image, vk::DeviceMemory, vk::ImageView, vk::Sampler) {
     unsafe {
+        let image_size = (width * height * 4) as u64;
+        
+        // Create staging buffer
+        let staging_buffer_info = vk::BufferCreateInfo::default()
+            .size(image_size)
+            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let staging_buffer = device.create_buffer(&staging_buffer_info, None).unwrap();
+        let staging_mem_requirements = device.get_buffer_memory_requirements(staging_buffer);
+        
+        let staging_alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(staging_mem_requirements.size)
+            .memory_type_index(find_memory_type(memory_properties, staging_mem_requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT));
+        let staging_memory = device.allocate_memory(&staging_alloc_info, None).unwrap();
+        device.bind_buffer_memory(staging_buffer, staging_memory, 0).unwrap();
+        
+        // Upload pixels to staging buffer
+        let ptr = device.map_memory(staging_memory, 0, image_size, vk::MemoryMapFlags::empty()).unwrap() as *mut u8;
+        std::ptr::copy_nonoverlapping(pixels.as_ptr(), ptr, pixels.len());
+        device.unmap_memory(staging_memory);
+        
+        // Create image with OPTIMAL tiling (proper GPU layout)
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
-            .format(vk::Format::R8G8B8A8_SRGB)
+            .format(vk::Format::R8G8B8A8_UNORM)
             .extent(vk::Extent3D { width, height, depth: 1 })
             .mip_levels(1)
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::LINEAR)
-            .usage(vk::ImageUsageFlags::SAMPLED)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::PREINITIALIZED);
+            .initial_layout(vk::ImageLayout::UNDEFINED);
         
         let image = device.create_image(&image_info, None).unwrap();
         let mem_requirements = device.get_image_memory_requirements(image);
@@ -404,24 +430,12 @@ fn create_font_texture(
         let alloc_info = vk::MemoryAllocateInfo::default()
             .allocation_size(mem_requirements.size)
             .memory_type_index(find_memory_type(memory_properties, mem_requirements.memory_type_bits,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT));
+                vk::MemoryPropertyFlags::DEVICE_LOCAL));
         
         let memory = device.allocate_memory(&alloc_info, None).unwrap();
         device.bind_image_memory(image, memory, 0).unwrap();
         
-        // Upload pixels
-        let subresource = vk::ImageSubresource::default().aspect_mask(vk::ImageAspectFlags::COLOR);
-        let layout = device.get_image_subresource_layout(image, subresource);
-        
-        let ptr = device.map_memory(memory, 0, mem_requirements.size, vk::MemoryMapFlags::empty()).unwrap() as *mut u8;
-        for y in 0..height {
-            let src_offset = (y * width * 4) as usize;
-            let dst_offset = (y as u64 * layout.row_pitch) as isize;
-            std::ptr::copy_nonoverlapping(pixels.as_ptr().add(src_offset), ptr.offset(dst_offset), (width * 4) as usize);
-        }
-        device.unmap_memory(memory);
-        
-        // Transition layout
+        // Transfer data from staging buffer to image
         let alloc_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
@@ -431,8 +445,46 @@ fn create_font_texture(
         let begin_info = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         device.begin_command_buffer(command_buffer, &begin_info).unwrap();
         
+        // Transition to TRANSFER_DST_OPTIMAL
         let barrier = vk::ImageMemoryBarrier::default()
-            .old_layout(vk::ImageLayout::PREINITIALIZED)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+        
+        device.cmd_pipeline_barrier(command_buffer, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(), &[], &[], &[barrier]);
+        
+        // Copy buffer to image
+        let region = vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+            .image_extent(vk::Extent3D { width, height, depth: 1 });
+        
+        device.cmd_copy_buffer_to_image(command_buffer, staging_buffer, image, 
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
+        
+        // Transition to SHADER_READ_ONLY_OPTIMAL
+        let barrier = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -444,10 +496,10 @@ fn create_font_texture(
                 base_array_layer: 0,
                 layer_count: 1,
             })
-            .src_access_mask(vk::AccessFlags::HOST_WRITE)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
             .dst_access_mask(vk::AccessFlags::SHADER_READ);
         
-        device.cmd_pipeline_barrier(command_buffer, vk::PipelineStageFlags::HOST, vk::PipelineStageFlags::FRAGMENT_SHADER,
+        device.cmd_pipeline_barrier(command_buffer, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::FRAGMENT_SHADER,
             vk::DependencyFlags::empty(), &[], &[], &[barrier]);
         
         device.end_command_buffer(command_buffer).unwrap();
@@ -456,10 +508,14 @@ fn create_font_texture(
         device.queue_wait_idle(queue).unwrap();
         device.free_command_buffers(command_pool, &[command_buffer]);
         
+        // Cleanup staging buffer
+        device.destroy_buffer(staging_buffer, None);
+        device.free_memory(staging_memory, None);
+        
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk::Format::R8G8B8A8_SRGB)
+            .format(vk::Format::R8G8B8A8_UNORM)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,

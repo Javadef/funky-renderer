@@ -8,5 +8,7 @@ layout(location = 1) in vec4 v_color;
 layout(location = 0) out vec4 out_color;
 
 void main() {
-    out_color = v_color * texture(u_tex, v_uv);
+    // egui uses gamma-correct rendering
+    vec4 tex_linear = texture(u_tex, v_uv);
+    out_color = v_color * tex_linear;
 }
