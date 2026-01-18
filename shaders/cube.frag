@@ -16,18 +16,32 @@ layout(binding = 0) uniform UniformBufferObject {
 void main() {
     vec3 normal = normalize(fragNormal);
     vec3 lightDir = normalize(ubo.lightDir.xyz);
+    vec3 viewDir = normalize(ubo.cameraPos.xyz);
     
-    // Simple diffuse lighting
-    float diff = max(dot(normal, lightDir), 0.0);
+    // Strong directional light to show cube faces clearly
+    float NdotL = dot(normal, lightDir);
+    float diff = max(NdotL, 0.0);
     
-    // Softer pastel lighting - higher ambient for softer look
-    vec3 ambient = 0.65 * fragColor;
-    vec3 diffuse = 0.45 * diff * fragColor;
+    // Add a secondary fill light from opposite side
+    vec3 fillLightDir = normalize(vec3(-0.5, 0.3, -0.8));
+    float fillDiff = max(dot(normal, fillLightDir), 0.0) * 0.3;
     
-    // Soft highlight
-    float highlight = pow(max(diff, 0.0), 3.0) * 0.15;
+    // Specular highlight (Blinn-Phong)
+    vec3 halfDir = normalize(lightDir + viewDir);
+    float spec = pow(max(dot(normal, halfDir), 0.0), 64.0);
     
-    vec3 result = ambient + diffuse + vec3(highlight);
+    // Rim/edge lighting to outline the cube
+    float rim = 1.0 - max(dot(viewDir, normal), 0.0);
+    rim = pow(rim, 2.0) * 0.5;
+    
+    // Combine lighting - lower ambient so faces are more distinct
+    vec3 ambient = 0.20 * fragColor;
+    vec3 diffuse = 0.65 * diff * fragColor;
+    vec3 fill = fillDiff * fragColor;
+    vec3 specular = vec3(0.4) * spec;
+    vec3 rimLight = vec3(0.8, 0.9, 1.0) * rim; // Slight blue tint on edges
+    
+    vec3 result = ambient + diffuse + fill + specular + rimLight;
     
     outColor = vec4(result, 1.0);
 }
