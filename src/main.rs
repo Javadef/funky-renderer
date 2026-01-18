@@ -341,9 +341,6 @@ impl ApplicationHandler for App {
                 if !self.minimized {
                     self.render_frame();
                 }
-                if let Some(window) = &self.window {
-                    window.request_redraw();
-                }
             }
             _ => {}
         }
@@ -387,11 +384,19 @@ impl App {
         let window_size = self.window.as_ref().map(|w| w.inner_size());
         
         unsafe {
-            renderer.device.wait_for_fences(
+            // Wait for previous frame with timeout to prevent indefinite blocking
+            let timeout = 1_000_000_000; // 1 second in nanoseconds
+            match renderer.device.wait_for_fences(
                 &[renderer.in_flight_fences[renderer.current_frame]],
                 true,
-                u64::MAX,
-            ).unwrap();
+                timeout,
+            ) {
+                Ok(_) => {},
+                Err(e) => {
+                    eprintln!("Fence wait timeout or error: {:?}", e);
+                    return;
+                }
+            }
             
             let result = renderer.swapchain_fn.acquire_next_image(
                 renderer.swapchain,
@@ -502,10 +507,10 @@ impl App {
 
                     // Keep Vulkan font atlas in sync with egui (required for correct text on some machines/DPI settings)
                     if !full_output.textures_delta.set.is_empty() {
-                        renderer
-                            .device
-                            .wait_for_fences(&renderer.in_flight_fences, true, u64::MAX)
-                            .unwrap();
+                        let timeout = 1_000_000_000; // 1 second
+                        if let Err(e) = renderer.device.wait_for_fences(&renderer.in_flight_fences, true, timeout) {
+                            eprintln!("Fence wait timeout during texture update: {:?}", e);
+                        }
                     }
                     egui_vk.update_textures(
                         &renderer.device,

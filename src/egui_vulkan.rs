@@ -195,9 +195,11 @@ impl EguiVulkanRenderer {
             let (font_image_vk, font_image_memory, font_image_view, font_sampler) = {
                 let font_image = ctx.fonts(|fonts| {
                     let image = fonts.image();
-                    let pixels: Vec<u8> = image.pixels.iter().flat_map(|&r| {
-                        let byte = (r * 255.0) as u8;
-                        [255u8, 255u8, 255u8, byte]
+                    // egui font texture is single-channel coverage map
+                    // Convert to RGBA: white RGB with coverage as alpha
+                    let pixels: Vec<u8> = image.pixels.iter().flat_map(|&coverage| {
+                        let alpha = (coverage * 255.0) as u8;
+                        [255u8, 255u8, 255u8, alpha]
                     }).collect();
                     (image.width() as u32, image.height() as u32, pixels)
                 });
@@ -265,6 +267,20 @@ impl EguiVulkanRenderer {
                 index_buffer_size: 512 * 1024,
             }
         }
+    }
+    
+    pub fn update_textures(
+        &mut self,
+        _device: &ash::Device,
+        _instance: &ash::Instance,
+        _physical_device: vk::PhysicalDevice,
+        _graphics_queue: vk::Queue,
+        _graphics_queue_family_index: u32,
+        _textures_delta: &egui::TexturesDelta,
+    ) {
+        // For now, we only handle the font texture which is set during initialization
+        // In a more complete implementation, this would handle dynamic texture updates
+        // from textures_delta.set and textures_delta.free
     }
     
     pub fn render(

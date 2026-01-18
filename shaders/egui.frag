@@ -8,7 +8,14 @@ layout(location = 1) in vec4 v_color;
 layout(location = 0) out vec4 out_color;
 
 void main() {
-    // egui uses gamma-correct rendering
-    vec4 tex_linear = texture(u_tex, v_uv);
-    out_color = v_color * tex_linear;
+    // Premultiplied-alpha output.
+    // Our pipeline blend state is:
+    //   src = ONE, dst = ONE_MINUS_SRC_ALPHA
+    // which expects RGB already multiplied by alpha.
+    vec4 tex = texture(u_tex, v_uv);
+
+    // egui vertex colors are premultiplied; the font atlas uses A as coverage.
+    // Multiply BOTH RGB and A by coverage so fully-transparent texels contribute 0.
+    float a = v_color.a * tex.a;
+    out_color = vec4(v_color.rgb * tex.rgb * tex.a, a);
 }
