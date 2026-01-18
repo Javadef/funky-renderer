@@ -1,0 +1,16 @@
+[package]
+name = "funkyrenderer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Vulkan with ash 0.38 API (uses .default() instead of .builder())
+ash = { version = "0.38", features = ["linked"] }
+ash-window = "0.13"
+gpu-allocator = { version = "0.28", default-features = false, features = ["vulkan", "std"] }
+winit = "0.30"
+raw-window-handle = "0.6"
+glam = "0.29"
+parking_lot = "0.12"
+rayon = "1.11"
+num_cpus = "1.16"
