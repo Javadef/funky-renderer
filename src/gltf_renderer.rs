@@ -42,6 +42,24 @@ pub struct GltfRenderer {
     pub shadow_layer_views: Vec<vk::ImageView>,
     pub shadow_allocation: Option<Allocation>,
     pub shadow_sampler: vk::Sampler,
+    pub shadow_depth_sampler: vk::Sampler,
+
+    // Scene depth samplers for contact shadow ray marching (Tiny Glade style)
+    pub scene_depth_sampler_linear: vk::Sampler,   // Bilinear filtering
+    pub scene_depth_sampler_nearest: vk::Sampler,  // Point sampling
+
+    // Shadow history for shadow-specific TAA (per swapchain image, ping-pong)
+    pub shadow_history_images_a: Vec<vk::Image>,
+    pub shadow_history_views_a: Vec<vk::ImageView>,
+    pub shadow_history_allocations_a: Vec<Option<Allocation>>,
+    pub shadow_history_images_b: Vec<vk::Image>,
+    pub shadow_history_views_b: Vec<vk::ImageView>,
+    pub shadow_history_allocations_b: Vec<Option<Allocation>>,
+    pub shadow_history_sampler: vk::Sampler,
+    pub shadow_history_pingpong: Vec<u8>,
+    pub prev_view_proj: Mat4,
+    pub has_prev_view_proj: bool,
+    pub shadow_frame_index: u32,
     pub shadow_render_pass: vk::RenderPass,
     pub shadow_framebuffers: Vec<vk::Framebuffer>,
     pub shadow_pipeline: vk::Pipeline,
@@ -83,6 +101,8 @@ pub struct GltfUniformBufferObject {
 
     pub debug_flags: [f32; 4],
     pub shadow_bias: [f32; 4],
+
+    pub prev_view_proj: [[f32; 4]; 4],
 }
 
 pub struct GltfMeshBuffers {
@@ -149,7 +169,16 @@ impl GltfRenderer {
         };
 
         // Create cascaded shadow map resources (depth array)
-        let (shadow_image, shadow_image_view, shadow_layer_views, shadow_allocation, shadow_sampler) =
+        let (
+            shadow_image,
+            shadow_image_view,
+            shadow_layer_views,
+            shadow_allocation,
+            shadow_sampler,
+            shadow_depth_sampler,
+            scene_depth_sampler_linear,
+            scene_depth_sampler_nearest,
+        ) =
             Self::create_shadow_resources(renderer, depth_format)?;
 
         // Initialize the shadow image into a known layout so per-frame transitions are valid.
@@ -167,8 +196,25 @@ impl GltfRenderer {
             shadow_render_pass,
             &shadow_layer_views,
         )?;
+
+        // Create shadow history resources for shadow-specific TAA
+        let (
+            shadow_history_images_a,
+            shadow_history_views_a,
+            shadow_history_allocations_a,
+            shadow_history_images_b,
+            shadow_history_views_b,
+            shadow_history_allocations_b,
+            shadow_history_sampler,
+            shadow_history_pingpong,
+        ) = Self::create_shadow_history_resources(
+            renderer,
+            renderer.swapchain_extent.width,
+            renderer.swapchain_extent.height,
+            renderer.swapchain_image_views.len(),
+        )?;
         
-        // Create descriptor set layout (UBO + albedo sampler + shadow sampler)
+        // Create descriptor set layout (UBO + albedo sampler + shadow compare sampler + shadow depth sampler + shadow history)
         let ubo_binding = vk::DescriptorSetLayoutBinding::default()
             .binding(0)
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
@@ -186,8 +232,48 @@ impl GltfRenderer {
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+
+        let shadow_depth_binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(3)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+
+        let shadow_history_read_binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(4)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+
+        let shadow_history_write_binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(5)
+            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+
+        // Scene depth for contact shadow ray marching (Tiny Glade linear+point trick)
+        let scene_depth_linear_binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(6)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+
+        let scene_depth_nearest_binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(7)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT);
         
-        let bindings = [ubo_binding, sampler_binding, shadow_binding];
+        let bindings = [
+            ubo_binding,
+            sampler_binding,
+            shadow_binding,
+            shadow_depth_binding,
+            shadow_history_read_binding,
+            shadow_history_write_binding,
+            scene_depth_linear_binding,
+            scene_depth_nearest_binding,
+        ];
         let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
         let descriptor_set_layout = renderer.device.create_descriptor_set_layout(&layout_info, None)?;
         
@@ -231,8 +317,14 @@ impl GltfRenderer {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                // binding=1 (albedo) + binding=2 (shadow)
-                descriptor_count: (MAX_FRAMES_IN_FLIGHT * 2) as u32,
+                // binding=1 (albedo) + binding=2 (shadow compare) + binding=3 (shadow depth) + binding=4 (history read)
+                // + binding=6 (scene depth linear) + binding=7 (scene depth nearest)
+                descriptor_count: (MAX_FRAMES_IN_FLIGHT * 6) as u32,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_IMAGE,
+                // binding=5 (history write)
+                descriptor_count: MAX_FRAMES_IN_FLIGHT as u32,
             },
         ];
         
@@ -293,6 +385,37 @@ impl GltfRenderer {
                 image_view: shadow_image_view,
                 image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             };
+
+            let shadow_depth_image_info = vk::DescriptorImageInfo {
+                sampler: shadow_depth_sampler,
+                image_view: shadow_image_view,
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            };
+
+            // History bindings start at swapchain image 0 (updated per-frame in render())
+            let history_read_image_info = vk::DescriptorImageInfo {
+                sampler: shadow_history_sampler,
+                image_view: shadow_history_views_a[0],
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            };
+            let history_write_image_info = vk::DescriptorImageInfo {
+                sampler: vk::Sampler::null(),
+                image_view: shadow_history_views_b[0],
+                image_layout: vk::ImageLayout::GENERAL,
+            };
+
+            // Scene depth for contact shadow ray marching (Tiny Glade linear+point trick)
+            // Use depth_image_views[0] as placeholder; updated per-frame in render()
+            let scene_depth_linear_info = vk::DescriptorImageInfo {
+                sampler: scene_depth_sampler_linear,
+                image_view: depth_image_views[0],
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            };
+            let scene_depth_nearest_info = vk::DescriptorImageInfo {
+                sampler: scene_depth_sampler_nearest,
+                image_view: depth_image_views[0],
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            };
             
             let descriptor_writes = [
                 vk::WriteDescriptorSet::default()
@@ -310,6 +433,31 @@ impl GltfRenderer {
                     .dst_binding(2)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(std::slice::from_ref(&shadow_image_info)),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_sets[i])
+                    .dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&shadow_depth_image_info)),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_sets[i])
+                    .dst_binding(4)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&history_read_image_info)),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_sets[i])
+                    .dst_binding(5)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .image_info(std::slice::from_ref(&history_write_image_info)),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_sets[i])
+                    .dst_binding(6)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&scene_depth_linear_info)),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_sets[i])
+                    .dst_binding(7)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&scene_depth_nearest_info)),
             ];
             
             renderer.device.update_descriptor_sets(&descriptor_writes, &[]);
@@ -433,6 +581,22 @@ impl GltfRenderer {
             shadow_layer_views,
             shadow_allocation: Some(shadow_allocation),
             shadow_sampler,
+            shadow_depth_sampler,
+
+            scene_depth_sampler_linear,
+            scene_depth_sampler_nearest,
+
+            shadow_history_images_a,
+            shadow_history_views_a,
+            shadow_history_allocations_a,
+            shadow_history_images_b,
+            shadow_history_views_b,
+            shadow_history_allocations_b,
+            shadow_history_sampler,
+            shadow_history_pingpong,
+            prev_view_proj: Mat4::IDENTITY,
+            has_prev_view_proj: false,
+            shadow_frame_index: 0,
             shadow_render_pass,
             shadow_framebuffers,
             shadow_pipeline,
@@ -564,7 +728,19 @@ impl GltfRenderer {
     unsafe fn create_shadow_resources(
         renderer: &VulkanRenderer,
         format: vk::Format,
-    ) -> Result<(vk::Image, vk::ImageView, Vec<vk::ImageView>, Allocation, vk::Sampler), Box<dyn std::error::Error>> {
+    ) -> Result<
+        (
+            vk::Image,
+            vk::ImageView,
+            Vec<vk::ImageView>,
+            Allocation,
+            vk::Sampler,
+            vk::Sampler,
+            vk::Sampler,  // scene_depth_linear
+            vk::Sampler,  // scene_depth_nearest
+        ),
+        Box<dyn std::error::Error>,
+    > {
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
@@ -640,9 +816,244 @@ impl GltfRenderer {
             .compare_op(vk::CompareOp::LESS_OR_EQUAL)
             .min_lod(0.0)
             .max_lod(0.0);
+        let compare_sampler = renderer.device.create_sampler(&sampler_info, None)?;
+
+        // Non-compare depth sampler for raw depth reads (needed for PCSS blocker search).
+        let depth_sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::NEAREST)
+            .min_filter(vk::Filter::NEAREST)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+            .border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE)
+            .compare_enable(false)
+            .min_lod(0.0)
+            .max_lod(0.0);
+        let depth_sampler = renderer.device.create_sampler(&depth_sampler_info, None)?;
+
+        // Scene depth samplers for contact shadow ray marching (Tiny Glade linear+point trick)
+        let scene_depth_linear_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .compare_enable(false)
+            .min_lod(0.0)
+            .max_lod(0.0);
+        let scene_depth_linear = renderer.device.create_sampler(&scene_depth_linear_info, None)?;
+
+        let scene_depth_nearest_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::NEAREST)
+            .min_filter(vk::Filter::NEAREST)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .compare_enable(false)
+            .min_lod(0.0)
+            .max_lod(0.0);
+        let scene_depth_nearest = renderer.device.create_sampler(&scene_depth_nearest_info, None)?;
+
+        Ok((image, array_view, layer_views, allocation, compare_sampler, depth_sampler, scene_depth_linear, scene_depth_nearest))
+    }
+
+    unsafe fn create_shadow_history_resources(
+        renderer: &VulkanRenderer,
+        width: u32,
+        height: u32,
+        count: usize,
+    ) -> Result<
+        (
+            Vec<vk::Image>,
+            Vec<vk::ImageView>,
+            Vec<Option<Allocation>>,
+            Vec<vk::Image>,
+            Vec<vk::ImageView>,
+            Vec<Option<Allocation>>,
+            vk::Sampler,
+            Vec<u8>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let mut images_a = Vec::with_capacity(count);
+        let mut views_a = Vec::with_capacity(count);
+        let mut allocs_a: Vec<Option<Allocation>> = Vec::with_capacity(count);
+        let mut images_b = Vec::with_capacity(count);
+        let mut views_b = Vec::with_capacity(count);
+        let mut allocs_b: Vec<Option<Allocation>> = Vec::with_capacity(count);
+
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R16G16_SFLOAT)
+            .extent(vk::Extent3D { width, height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+
+        for _ in 0..count {
+            let (img_a, view_a, alloc_a) = Self::create_rg16f_image(renderer, &image_info)?;
+            images_a.push(img_a);
+            views_a.push(view_a);
+            allocs_a.push(Some(alloc_a));
+
+            let (img_b, view_b, alloc_b) = Self::create_rg16f_image(renderer, &image_info)?;
+            images_b.push(img_b);
+            views_b.push(view_b);
+            allocs_b.push(Some(alloc_b));
+        }
+
+        let sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::NEAREST)
+            .min_filter(vk::Filter::NEAREST)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .compare_enable(false)
+            .min_lod(0.0)
+            .max_lod(0.0);
         let sampler = renderer.device.create_sampler(&sampler_info, None)?;
 
-        Ok((image, array_view, layer_views, allocation, sampler))
+        // Initialize to fully lit (1.0) + far depth (1.0 in Vulkan NDC)
+        for img in images_a.iter().chain(images_b.iter()) {
+            Self::clear_rg16f_image(renderer, *img, 1.0, 1.0)?;
+        }
+
+        Ok((
+            images_a,
+            views_a,
+            allocs_a,
+            images_b,
+            views_b,
+            allocs_b,
+            sampler,
+            vec![0u8; count],
+        ))
+    }
+
+    unsafe fn create_rg16f_image(
+        renderer: &VulkanRenderer,
+        image_info: &vk::ImageCreateInfo,
+    ) -> Result<(vk::Image, vk::ImageView, Allocation), Box<dyn std::error::Error>> {
+        let image = renderer.device.create_image(image_info, None)?;
+        let requirements = renderer.device.get_image_memory_requirements(image);
+
+        let allocation = renderer.allocator.lock().allocate(&AllocationCreateDesc {
+            name: "shadow_history",
+            requirements,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })?;
+        renderer
+            .device
+            .bind_image_memory(image, allocation.memory(), allocation.offset())?;
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::R16G16_SFLOAT)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        let view = renderer.device.create_image_view(&view_info, None)?;
+        Ok((image, view, allocation))
+    }
+
+    unsafe fn clear_rg16f_image(
+        renderer: &VulkanRenderer,
+        image: vk::Image,
+        shadow: f32,
+        depth: f32,
+    ) -> Result<(), vk::Result> {
+        let cmd_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(renderer.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cmd = renderer.device.allocate_command_buffers(&cmd_info)?[0];
+
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        renderer.device.begin_command_buffer(cmd, &begin_info)?;
+
+        let range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+
+        // UNDEFINED -> TRANSFER_DST
+        let to_transfer = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::empty())
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(range);
+        renderer.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            std::slice::from_ref(&to_transfer),
+        );
+
+        let clear = vk::ClearColorValue {
+            float32: [shadow, depth, 0.0, 0.0],
+        };
+        renderer.device.cmd_clear_color_image(
+            cmd,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &clear,
+            std::slice::from_ref(&range),
+        );
+
+        // TRANSFER_DST -> SHADER_READ
+        let to_read = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(range);
+        renderer.device.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            std::slice::from_ref(&to_read),
+        );
+
+        renderer.device.end_command_buffer(cmd)?;
+        let submit_info = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+        renderer
+            .device
+            .queue_submit(renderer.graphics_queue, &[submit_info], vk::Fence::null())?;
+        renderer.device.queue_wait_idle(renderer.graphics_queue)?;
+        renderer.device.free_command_buffers(renderer.command_pool, &[cmd]);
+        Ok(())
     }
 
     unsafe fn create_shadow_render_pass(
@@ -1382,6 +1793,8 @@ impl GltfRenderer {
         aspect_ratio: f32,
         debug_cascades: bool,
         shadow_softness: f32,
+        use_pcss: bool,
+        use_shadow_taa: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Calculate camera direction from yaw and pitch
         let camera_front = glam::Vec3::new(
@@ -1405,6 +1818,13 @@ impl GltfRenderer {
         // many helper functions. Flip Y so "up" on input corresponds to "up" on screen.
         let mut proj = glam::Mat4::perspective_rh(camera_fov, aspect_ratio, 0.1, 100.0);
         proj.y_axis.y *= -1.0;
+
+        let view_proj = proj * view;
+        let prev_view_proj = if self.has_prev_view_proj {
+            self.prev_view_proj
+        } else {
+            view_proj
+        };
 
         // Cascaded shadow maps (4 splits)
         let near_plane = 0.1_f32;
@@ -1527,6 +1947,8 @@ impl GltfRenderer {
             prev_split = split;
         }
         
+        let frame_f = (self.shadow_frame_index as f32) % 1024.0;
+
         let ubo = GltfUniformBufferObject {
             view: view.to_cols_array_2d(),
             proj: proj.to_cols_array_2d(),
@@ -1545,17 +1967,28 @@ impl GltfRenderer {
                 1.0 / SHADOW_MAP_SIZE as f32,
             ],
 
-            debug_flags: [if debug_cascades { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+            debug_flags: [
+                if debug_cascades { 1.0 } else { 0.0 },
+                if use_pcss { 1.0 } else { 0.0 },
+                if use_shadow_taa { 1.0 } else { 0.0 },
+                frame_f,
+            ],
             // Reusing this vec4 for shadow params:
-            // x = Poisson PCF radius in texels
+            // x = Light size in texels (for PCSS penumbra / PCF radius)
             shadow_bias: [shadow_softness, 0.0, 0.0, 0.0],
+
+            prev_view_proj: prev_view_proj.to_cols_array_2d(),
         };
         
         if let Some(allocation) = &self.uniform_allocations[current_frame] {
             let ptr = allocation.mapped_ptr().unwrap().as_ptr() as *mut GltfUniformBufferObject;
             std::ptr::copy_nonoverlapping(&ubo, ptr, 1);
         }
-        
+
+        self.prev_view_proj = view_proj;
+        self.has_prev_view_proj = true;
+        self.shadow_frame_index = self.shadow_frame_index.wrapping_add(1);
+
         Ok(())
     }
     
@@ -1744,6 +2177,77 @@ impl GltfRenderer {
             );
         }
 
+        // Shadow history TAA: update descriptors for this swapchain image and prepare storage write target
+        {
+            let idx = image_index as usize;
+            let ping = self.shadow_history_pingpong[idx] as usize;
+
+            let (read_view, write_view, write_image) = if ping == 0 {
+                (
+                    self.shadow_history_views_a[idx],
+                    self.shadow_history_views_b[idx],
+                    self.shadow_history_images_b[idx],
+                )
+            } else {
+                (
+                    self.shadow_history_views_b[idx],
+                    self.shadow_history_views_a[idx],
+                    self.shadow_history_images_a[idx],
+                )
+            };
+
+            let history_read = vk::DescriptorImageInfo {
+                sampler: self.shadow_history_sampler,
+                image_view: read_view,
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            };
+            let history_write = vk::DescriptorImageInfo {
+                sampler: vk::Sampler::null(),
+                image_view: write_view,
+                image_layout: vk::ImageLayout::GENERAL,
+            };
+
+            let writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.descriptor_sets[current_frame])
+                    .dst_binding(4)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&history_read)),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.descriptor_sets[current_frame])
+                    .dst_binding(5)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .image_info(std::slice::from_ref(&history_write)),
+            ];
+            device.update_descriptor_sets(&writes, &[]);
+
+            // SHADER_READ_ONLY -> GENERAL for storage writes in gltf.frag
+            let to_general = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_access_mask(vk::AccessFlags::SHADER_READ)
+                .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(write_image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&to_general),
+            );
+        }
+
         // Begin render pass
         let clear_values = [
             vk::ClearValue {
@@ -1837,8 +2341,49 @@ impl GltfRenderer {
         }
     }
     
-    pub unsafe fn end_render_pass(&self, device: &ash::Device, command_buffer: vk::CommandBuffer) {
+    pub unsafe fn end_render_pass(
+        &mut self,
+        device: &ash::Device,
+        command_buffer: vk::CommandBuffer,
+        image_index: u32,
+    ) {
         device.cmd_end_render_pass(command_buffer);
+
+        // Shadow history TAA: finalize storage write target
+        let idx = image_index as usize;
+        let ping = self.shadow_history_pingpong[idx] as usize;
+        let write_image = if ping == 0 {
+            self.shadow_history_images_b[idx]
+        } else {
+            self.shadow_history_images_a[idx]
+        };
+
+        let to_read = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::GENERAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(write_image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        device.cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            std::slice::from_ref(&to_read),
+        );
+
+        self.shadow_history_pingpong[idx] = 1 - self.shadow_history_pingpong[idx];
     }
     
     pub unsafe fn cleanup(&mut self, renderer: &VulkanRenderer) {
@@ -1907,6 +2452,39 @@ impl GltfRenderer {
         renderer.device.destroy_pipeline_layout(self.shadow_pipeline_layout, None);
 
         renderer.device.destroy_sampler(self.shadow_sampler, None);
+        renderer.device.destroy_sampler(self.shadow_depth_sampler, None);
+
+        // Cleanup shadow history resources
+        renderer.device.destroy_sampler(self.shadow_history_sampler, None);
+        for (&view_a, &view_b) in self
+            .shadow_history_views_a
+            .iter()
+            .zip(self.shadow_history_views_b.iter())
+        {
+            renderer.device.destroy_image_view(view_a, None);
+            renderer.device.destroy_image_view(view_b, None);
+        }
+        for (&img_a, alloc_a) in self
+            .shadow_history_images_a
+            .iter()
+            .zip(self.shadow_history_allocations_a.iter_mut())
+        {
+            renderer.device.destroy_image(img_a, None);
+            if let Some(alloc) = alloc_a.take() {
+                let _ = renderer.allocator.lock().free(alloc);
+            }
+        }
+        for (&img_b, alloc_b) in self
+            .shadow_history_images_b
+            .iter()
+            .zip(self.shadow_history_allocations_b.iter_mut())
+        {
+            renderer.device.destroy_image(img_b, None);
+            if let Some(alloc) = alloc_b.take() {
+                let _ = renderer.allocator.lock().free(alloc);
+            }
+        }
+
         for &view in &self.shadow_layer_views {
             renderer.device.destroy_image_view(view, None);
         }
@@ -1980,6 +2558,98 @@ impl GltfRenderer {
                 .height(renderer.swapchain_extent.height)
                 .layers(1);
             self.framebuffers.push(renderer.device.create_framebuffer(&framebuffer_info, None)?);
+        }
+
+        // Recreate shadow history resources (size depends on swapchain extent)
+        renderer.device.destroy_sampler(self.shadow_history_sampler, None);
+        for (&view_a, &view_b) in self
+            .shadow_history_views_a
+            .iter()
+            .zip(self.shadow_history_views_b.iter())
+        {
+            renderer.device.destroy_image_view(view_a, None);
+            renderer.device.destroy_image_view(view_b, None);
+        }
+        for ((&img_a, alloc_a), (&img_b, alloc_b)) in self
+            .shadow_history_images_a
+            .iter()
+            .zip(self.shadow_history_allocations_a.iter_mut())
+            .zip(
+                self.shadow_history_images_b
+                    .iter()
+                    .zip(self.shadow_history_allocations_b.iter_mut()),
+            )
+        {
+            renderer.device.destroy_image(img_a, None);
+            if let Some(alloc) = alloc_a.take() {
+                renderer.allocator.lock().free(alloc)?;
+            }
+            renderer.device.destroy_image(img_b, None);
+            if let Some(alloc) = alloc_b.take() {
+                renderer.allocator.lock().free(alloc)?;
+            }
+        }
+
+        self.shadow_history_images_a.clear();
+        self.shadow_history_views_a.clear();
+        self.shadow_history_allocations_a.clear();
+        self.shadow_history_images_b.clear();
+        self.shadow_history_views_b.clear();
+        self.shadow_history_allocations_b.clear();
+        self.shadow_history_pingpong.clear();
+
+        let (
+            shadow_history_images_a,
+            shadow_history_views_a,
+            shadow_history_allocations_a,
+            shadow_history_images_b,
+            shadow_history_views_b,
+            shadow_history_allocations_b,
+            shadow_history_sampler,
+            shadow_history_pingpong,
+        ) = Self::create_shadow_history_resources(
+            renderer,
+            renderer.swapchain_extent.width,
+            renderer.swapchain_extent.height,
+            renderer.swapchain_image_views.len(),
+        )?;
+        self.shadow_history_images_a = shadow_history_images_a;
+        self.shadow_history_views_a = shadow_history_views_a;
+        self.shadow_history_allocations_a = shadow_history_allocations_a;
+        self.shadow_history_images_b = shadow_history_images_b;
+        self.shadow_history_views_b = shadow_history_views_b;
+        self.shadow_history_allocations_b = shadow_history_allocations_b;
+        self.shadow_history_sampler = shadow_history_sampler;
+        self.shadow_history_pingpong = shadow_history_pingpong;
+
+        // Refresh descriptor sets with initial history views (render() overwrites per-frame anyway)
+        if !self.shadow_history_views_a.is_empty() {
+            let history_read = vk::DescriptorImageInfo {
+                sampler: self.shadow_history_sampler,
+                image_view: self.shadow_history_views_a[0],
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            };
+            let history_write = vk::DescriptorImageInfo {
+                sampler: vk::Sampler::null(),
+                image_view: self.shadow_history_views_b[0],
+                image_layout: vk::ImageLayout::GENERAL,
+            };
+
+            for i in 0..MAX_FRAMES_IN_FLIGHT {
+                let writes = [
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.descriptor_sets[i])
+                        .dst_binding(4)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(std::slice::from_ref(&history_read)),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.descriptor_sets[i])
+                        .dst_binding(5)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .image_info(std::slice::from_ref(&history_write)),
+                ];
+                renderer.device.update_descriptor_sets(&writes, &[]);
+            }
         }
         
         Ok(())

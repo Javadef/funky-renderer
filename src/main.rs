@@ -154,8 +154,12 @@ impl Default for SceneObjects {
 #[derive(Resource, Clone, Copy)]
 pub struct ShadowSettings {
     pub debug_cascades: bool,
-    // Shadow softness radius in texels (higher = softer / more expensive).
+    // Shadow softness / light size in texels (higher = softer / more expensive).
     pub softness: f32,
+    // Use PCSS (contact hardening) instead of fixed-radius PCF.
+    pub use_pcss: bool,
+    // Shadow-only TAA (history reprojection + variance clamp) to stabilize soft penumbras.
+    pub use_shadow_taa: bool,
 }
 
 impl Default for ShadowSettings {
@@ -163,6 +167,8 @@ impl Default for ShadowSettings {
         Self {
             debug_cascades: false,
             softness: 2.5,
+            use_pcss: true, // Default to PCSS for Tiny Glade style shadows
+            use_shadow_taa: true,
         }
     }
 }
@@ -703,6 +709,8 @@ impl App {
                     aspect_ratio,
                     shadow_settings.debug_cascades,
                     shadow_settings.softness,
+                    shadow_settings.use_pcss,
+                    shadow_settings.use_shadow_taa,
                 ) {
                     eprintln!("Failed to update glTF uniform buffer: {}", e);
                 }
@@ -717,7 +725,11 @@ impl App {
                 );
                 
                 // End glTF render pass
-                gltf_renderer.end_render_pass(&renderer.device, renderer.command_buffers[renderer.current_frame]);
+                gltf_renderer.end_render_pass(
+                    &renderer.device,
+                    renderer.command_buffers[renderer.current_frame],
+                    image_index,
+                );
             }
             
             // Render egui (in the old render pass for overlays)
@@ -758,6 +770,8 @@ impl App {
                         gltf_scale: current_gltf_scale,
                         shadow_debug_cascades: shadow_settings.debug_cascades,
                         shadow_softness: shadow_settings.softness,
+                        shadow_use_pcss: shadow_settings.use_pcss,
+                        shadow_use_taa: shadow_settings.use_shadow_taa,
                     };
 
                     let (full_output, ui_changes) = egui_int.build_ui(window, &ui_data);
@@ -771,6 +785,8 @@ impl App {
                         let mut s = self.world.resource_mut::<ShadowSettings>();
                         s.debug_cascades = ui_changes.shadow_debug_cascades;
                         s.softness = ui_changes.shadow_softness;
+                        s.use_pcss = ui_changes.shadow_use_pcss;
+                        s.use_shadow_taa = ui_changes.shadow_use_taa;
                     }
 
                     // Keep Vulkan font atlas in sync with egui

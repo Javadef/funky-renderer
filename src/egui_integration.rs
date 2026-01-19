@@ -72,6 +72,8 @@ pub struct UiData {
     // Shadows
     pub shadow_debug_cascades: bool,
     pub shadow_softness: f32,
+    pub shadow_use_pcss: bool,
+    pub shadow_use_taa: bool,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -81,6 +83,8 @@ pub struct UiChanges {
     pub shadow_settings_changed: bool,
     pub shadow_debug_cascades: bool,
     pub shadow_softness: f32,
+    pub shadow_use_pcss: bool,
+    pub shadow_use_taa: bool,
 }
 
 pub struct ComponentCounts {
@@ -97,6 +101,8 @@ fn render_debug_ui(ctx: &egui::Context, data: &UiData) -> UiChanges {
         shadow_settings_changed: false,
         shadow_debug_cascades: data.shadow_debug_cascades,
         shadow_softness: data.shadow_softness,
+        shadow_use_pcss: data.shadow_use_pcss,
+        shadow_use_taa: data.shadow_use_taa,
     };
     
     egui::Window::new("🎮 Funky Renderer Debug")
@@ -137,15 +143,29 @@ fn render_debug_ui(ctx: &egui::Context, data: &UiData) -> UiChanges {
                 changes.shadow_debug_cascades = debug_cascades;
             }
 
+            let mut use_pcss = data.shadow_use_pcss;
+            if ui.checkbox(&mut use_pcss, "PCSS (contact hardening)").changed() {
+                changes.shadow_settings_changed = true;
+                changes.shadow_use_pcss = use_pcss;
+            }
+            ui.small("Tiny Glade style: soft near, sharp at contact");
+
+            let mut use_taa = data.shadow_use_taa;
+            if ui.checkbox(&mut use_taa, "Shadow TAA (stabilize penumbra)").changed() {
+                changes.shadow_settings_changed = true;
+                changes.shadow_use_taa = use_taa;
+            }
+            ui.small("Temporal filter with variance clamp; reduces crawl");
+
             let mut softness = data.shadow_softness;
             if ui
-                .add(egui::Slider::new(&mut softness, 0.5..=8.0).text("Softness (texels)"))
+                .add(egui::Slider::new(&mut softness, 0.5..=8.0).text("Light size (texels)"))
                 .changed()
             {
                 changes.shadow_settings_changed = true;
                 changes.shadow_softness = softness;
             }
-            ui.small("Poisson PCF: higher = softer, slower");
+            ui.small("Controls penumbra width");
             
             ui.add_space(10.0);
             ui.heading("Bevy ECS Stats");

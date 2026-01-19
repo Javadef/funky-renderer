@@ -10,8 +10,10 @@ layout(binding = 0) uniform UniformBufferObject {
     mat4 lightViewProj[4];
     vec4 cascadeSplits;
     vec4 shadowMapSize; // (w,h,1/w,1/h)
-    vec4 debugFlags;    // x = debug cascades
+    vec4 debugFlags;    // x = debug cascades, y = use PCSS, z = shadow TAA
     vec4 shadowBias;    // x = pcf slope-scale, y = pcf min-bias
+
+    mat4 prevViewProj;
 } ubo;
 
 layout(push_constant) uniform ShadowPushConstants {
