@@ -35,6 +35,49 @@ int selectCascade(float viewDepth) {
     return 3;
 }
 
+void selectCascadeBlend(float viewDepth, out int c0, out int c1, out float t) {
+    // Blend across cascade boundaries to avoid a hard "switch seam".
+    // Fade width scales with depth so it remains visible but cheap.
+    float s0 = ubo.cascadeSplits.x;
+    float s1 = ubo.cascadeSplits.y;
+    float s2 = ubo.cascadeSplits.z;
+    float f0 = max(0.10 * s0, 0.5);
+    float f1 = max(0.10 * s1, 0.5);
+    float f2 = max(0.10 * s2, 0.5);
+
+    if (viewDepth > s0 - f0 && viewDepth < s0 + f0) {
+        c0 = 0; c1 = 1;
+        t = smoothstep(s0 - f0, s0 + f0, viewDepth);
+        return;
+    }
+    if (viewDepth > s1 - f1 && viewDepth < s1 + f1) {
+        c0 = 1; c1 = 2;
+        t = smoothstep(s1 - f1, s1 + f1, viewDepth);
+        return;
+    }
+    if (viewDepth > s2 - f2 && viewDepth < s2 + f2) {
+        c0 = 2; c1 = 3;
+        t = smoothstep(s2 - f2, s2 + f2, viewDepth);
+        return;
+    }
+
+    c0 = selectCascade(viewDepth);
+    c1 = c0;
+    t = 0.0;
+}
+
+float hash12(vec2 p) {
+    // Cheap stable hash for per-pixel rotation
+    float h = dot(p, vec2(127.1, 311.7));
+    return fract(sin(h) * 43758.5453123);
+}
+
+mat2 rot2(float a) {
+    float s = sin(a);
+    float c = cos(a);
+    return mat2(c, -s, s, c);
+}
+
 float shadowPCF(int cascadeIndex, vec3 worldPos, vec3 normalWs, float NdotL) {
     // Receiver-side biasing:
     // - Normal offset reduces "triangle pattern" acne on curved/low-poly surfaces
@@ -59,16 +102,41 @@ float shadowPCF(int cascadeIndex, vec3 worldPos, vec3 normalWs, float NdotL) {
     float bias = baseBias + slopeBias;
 
     vec2 texel = ubo.shadowMapSize.zw;
+
+    // Softness radius in texels (passed from CPU). 1.0 ~= near-hard edge.
+    float radiusTexels = max(ubo.shadowBias.x, 0.5);
+
     float sum = 0.0;
-    
-    // 3x3 PCF with hardware comparison (fast!)
-    for (int y = -1; y <= 1; y++) {
-        for (int x = -1; x <= 1; x++) {
-            vec2 offset = vec2(float(x), float(y)) * texel;
-            sum += texture(shadowMap, vec4(uv + offset, float(cascadeIndex), depthRef - bias));
+
+    // Keep cheap 3x3 for near-hard shadows.
+    if (radiusTexels <= 1.25) {
+        for (int y = -1; y <= 1; y++) {
+            for (int x = -1; x <= 1; x++) {
+                vec2 offset = vec2(float(x), float(y)) * texel;
+                sum += texture(shadowMap, vec4(uv + offset, float(cascadeIndex), depthRef - bias));
+            }
         }
+        return sum / 9.0;
     }
-    return sum / 9.0;
+
+    // Poisson-disk PCF for softer penumbra.
+    const int TAP_COUNT = 12;
+    const vec2 poisson[TAP_COUNT] = vec2[TAP_COUNT](
+        vec2(-0.326, -0.406), vec2(-0.840, -0.074), vec2(-0.696,  0.457), vec2(-0.203,  0.621),
+        vec2( 0.962, -0.195), vec2( 0.473, -0.480), vec2( 0.519,  0.767), vec2( 0.185, -0.893),
+        vec2( 0.507,  0.064), vec2( 0.896,  0.412), vec2(-0.322, -0.933), vec2(-0.792, -0.598)
+    );
+
+    // Use a screen-space seed so the kernel rotation doesn't change across cascade boundaries.
+    float angle = hash12(gl_FragCoord.xy) * 6.2831853;
+    mat2 R = rot2(angle);
+    vec2 radiusUv = texel * radiusTexels;
+
+    for (int i = 0; i < TAP_COUNT; i++) {
+        vec2 offset = (R * poisson[i]) * radiusUv;
+        sum += texture(shadowMap, vec4(uv + offset, float(cascadeIndex), depthRef - bias));
+    }
+    return sum / float(TAP_COUNT);
 }
 
 void main() {
@@ -83,8 +151,16 @@ void main() {
     float NdotL = dot(normal, lightDir);
     float diff = max(NdotL, 0.0);
 
-    int cascadeIndex = selectCascade(fragViewDepth);
-    float shadow = shadowPCF(cascadeIndex, fragWorldPos, normal, diff);
+    int c0, c1;
+    float ct;
+    selectCascadeBlend(fragViewDepth, c0, c1, ct);
+
+    float shadow0 = shadowPCF(c0, fragWorldPos, normal, diff);
+    float shadow = shadow0;
+    if (ct > 0.0) {
+        float shadow1 = shadowPCF(c1, fragWorldPos, normal, diff);
+        shadow = mix(shadow0, shadow1, ct);
+    }
 
     if (ubo.debugFlags.x > 0.5) {
         vec3 colors[4] = vec3[4](
@@ -93,7 +169,10 @@ void main() {
             vec3(0.2, 0.4, 1.0),
             vec3(1.0, 1.0, 0.2)
         );
-        vec3 c = colors[cascadeIndex];
+        vec3 c = colors[c0];
+        if (ct > 0.0) {
+            c = mix(colors[c0], colors[c1], ct);
+        }
         outColor = vec4(c * (0.35 + 0.65 * shadow), 1.0);
         return;
     }

@@ -71,6 +71,7 @@ pub struct UiData {
 
     // Shadows
     pub shadow_debug_cascades: bool,
+    pub shadow_softness: f32,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -79,6 +80,7 @@ pub struct UiChanges {
 
     pub shadow_settings_changed: bool,
     pub shadow_debug_cascades: bool,
+    pub shadow_softness: f32,
 }
 
 pub struct ComponentCounts {
@@ -94,6 +96,7 @@ fn render_debug_ui(ctx: &egui::Context, data: &UiData) -> UiChanges {
 
         shadow_settings_changed: false,
         shadow_debug_cascades: data.shadow_debug_cascades,
+        shadow_softness: data.shadow_softness,
     };
     
     egui::Window::new("🎮 Funky Renderer Debug")
@@ -133,7 +136,16 @@ fn render_debug_ui(ctx: &egui::Context, data: &UiData) -> UiChanges {
                 changes.shadow_settings_changed = true;
                 changes.shadow_debug_cascades = debug_cascades;
             }
-            ui.small("Using linear+point sampling (no bias needed)");
+
+            let mut softness = data.shadow_softness;
+            if ui
+                .add(egui::Slider::new(&mut softness, 0.5..=8.0).text("Softness (texels)"))
+                .changed()
+            {
+                changes.shadow_settings_changed = true;
+                changes.shadow_softness = softness;
+            }
+            ui.small("Poisson PCF: higher = softer, slower");
             
             ui.add_space(10.0);
             ui.heading("Bevy ECS Stats");

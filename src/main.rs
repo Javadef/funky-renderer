@@ -151,10 +151,20 @@ impl Default for SceneObjects {
     }
 }
 
-#[derive(Resource, Clone, Copy, Default)]
+#[derive(Resource, Clone, Copy)]
 pub struct ShadowSettings {
     pub debug_cascades: bool,
-    // Linear+point sampling trick eliminates the need for bias!
+    // Shadow softness radius in texels (higher = softer / more expensive).
+    pub softness: f32,
+}
+
+impl Default for ShadowSettings {
+    fn default() -> Self {
+        Self {
+            debug_cascades: false,
+            softness: 2.5,
+        }
+    }
 }
 
 // ============================================================================
@@ -692,6 +702,7 @@ impl App {
                     gltf_scale,
                     aspect_ratio,
                     shadow_settings.debug_cascades,
+                    shadow_settings.softness,
                 ) {
                     eprintln!("Failed to update glTF uniform buffer: {}", e);
                 }
@@ -746,6 +757,7 @@ impl App {
                         gpu_name: renderer.gpu_name.clone(),
                         gltf_scale: current_gltf_scale,
                         shadow_debug_cascades: shadow_settings.debug_cascades,
+                        shadow_softness: shadow_settings.softness,
                     };
 
                     let (full_output, ui_changes) = egui_int.build_ui(window, &ui_data);
@@ -758,6 +770,7 @@ impl App {
                     if ui_changes.shadow_settings_changed {
                         let mut s = self.world.resource_mut::<ShadowSettings>();
                         s.debug_cascades = ui_changes.shadow_debug_cascades;
+                        s.softness = ui_changes.shadow_softness;
                     }
 
                     // Keep Vulkan font atlas in sync with egui

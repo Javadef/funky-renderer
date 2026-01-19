@@ -1381,6 +1381,7 @@ impl GltfRenderer {
         scale: f32,
         aspect_ratio: f32,
         debug_cascades: bool,
+        shadow_softness: f32,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Calculate camera direction from yaw and pitch
         let camera_front = glam::Vec3::new(
@@ -1485,10 +1486,34 @@ impl GltfRenderer {
             }
 
             let pad_xy = radius * 0.05;
-            let left = min.x - pad_xy;
-            let right = max.x + pad_xy;
-            let bottom = min.y - pad_xy;
-            let top = max.y + pad_xy;
+            let mut left = min.x - pad_xy;
+            let mut right = max.x + pad_xy;
+            let mut bottom = min.y - pad_xy;
+            let mut top = max.y + pad_xy;
+
+            // Cascade stabilization: snap the ortho window to texel increments.
+            // This reduces temporal shimmering when the camera moves.
+            {
+                let width = (right - left).max(0.001);
+                let height = (top - bottom).max(0.001);
+
+                let texel_x = width / SHADOW_MAP_SIZE as f32;
+                let texel_y = height / SHADOW_MAP_SIZE as f32;
+
+                let cx = 0.5 * (left + right);
+                let cy = 0.5 * (bottom + top);
+
+                let snapped_cx = (cx / texel_x).round() * texel_x;
+                let snapped_cy = (cy / texel_y).round() * texel_y;
+
+                let dx = snapped_cx - cx;
+                let dy = snapped_cy - cy;
+
+                left += dx;
+                right += dx;
+                bottom += dy;
+                top += dy;
+            }
 
             // Convert light-space z (RH look_at => forward is -Z) to positive distances.
             let pad_z = radius * 0.2;
@@ -1521,7 +1546,9 @@ impl GltfRenderer {
             ],
 
             debug_flags: [if debug_cascades { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
-            shadow_bias: [0.0, 0.0, 0.0, 0.0], // Not used - linear+point sampling eliminates bias
+            // Reusing this vec4 for shadow params:
+            // x = Poisson PCF radius in texels
+            shadow_bias: [shadow_softness, 0.0, 0.0, 0.0],
         };
         
         if let Some(allocation) = &self.uniform_allocations[current_frame] {
