@@ -43,19 +43,19 @@ impl EguiIntegration {
         self.ui_visible = !self.ui_visible;
     }
     
-    /// Build the UI and return FullOutput and optional scale changes
-    pub fn build_ui(&mut self, window: &Window, ui_data: &UiData) -> (egui::FullOutput, Option<(f32, f32)>) {
+    /// Build the UI and return FullOutput and optional changes
+    pub fn build_ui(&mut self, window: &Window, ui_data: &UiData) -> (egui::FullOutput, UiChanges) {
         let raw_input = self.state.take_egui_input(window);
         
-        let mut scale_changed = None;
+        let mut changes = UiChanges::default();
         
         let output = self.ctx.run(raw_input, |ctx| {
             if self.ui_visible {
-                scale_changed = render_debug_ui(ctx, ui_data);
+                changes = render_debug_ui(ctx, ui_data);
             }
         });
         
-        (output, scale_changed)
+        (output, changes)
     }
 }
 
@@ -68,6 +68,17 @@ pub struct UiData {
     pub vulkan_version: String,
     pub gpu_name: String,
     pub gltf_scale: f32,
+
+    // Shadows
+    pub shadow_debug_cascades: bool,
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct UiChanges {
+    pub gltf_scale: Option<f32>,
+
+    pub shadow_settings_changed: bool,
+    pub shadow_debug_cascades: bool,
 }
 
 pub struct ComponentCounts {
@@ -77,8 +88,13 @@ pub struct ComponentCounts {
     pub renderables: usize,
 }
 
-fn render_debug_ui(ctx: &egui::Context, data: &UiData) -> Option<(f32, f32)> {
-    let mut scale_changed = None;
+fn render_debug_ui(ctx: &egui::Context, data: &UiData) -> UiChanges {
+    let mut changes = UiChanges {
+        gltf_scale: None,
+
+        shadow_settings_changed: false,
+        shadow_debug_cascades: data.shadow_debug_cascades,
+    };
     
     egui::Window::new("🎮 Funky Renderer Debug")
         .default_pos([10.0, 10.0])
@@ -105,8 +121,19 @@ fn render_debug_ui(ctx: &egui::Context, data: &UiData) -> Option<(f32, f32)> {
             
             ui.label("Duck Scale:");
             if ui.add(egui::Slider::new(&mut gltf_scale, 0.001..=0.5).text("scale").logarithmic(true)).changed() {
-                scale_changed = Some((1.0, gltf_scale));
+                changes.gltf_scale = Some(gltf_scale);
             }
+
+            ui.add_space(10.0);
+            ui.heading("Shadows");
+            ui.separator();
+
+            let mut debug_cascades = data.shadow_debug_cascades;
+            if ui.checkbox(&mut debug_cascades, "Debug cascades").changed() {
+                changes.shadow_settings_changed = true;
+                changes.shadow_debug_cascades = debug_cascades;
+            }
+            ui.small("Using linear+point sampling (no bias needed)");
             
             ui.add_space(10.0);
             ui.heading("Bevy ECS Stats");
@@ -147,6 +174,6 @@ fn render_debug_ui(ctx: &egui::Context, data: &UiData) -> Option<(f32, f32)> {
             ui.label("🦀 Rust + Bevy ECS + ash (Vulkan)");
             ui.small("Press F3 to toggle UI");
         });
-    
-    scale_changed
+
+    changes
 }

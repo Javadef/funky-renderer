@@ -6,6 +6,9 @@ use crate::gltf_loader::GltfScene;
 use std::ffi::CString;
 use glam::{Mat4, Quat, Vec3};
 
+const SHADOW_CASCADE_COUNT: usize = 4;
+const SHADOW_MAP_SIZE: u32 = 2048;
+
 // Vertex format for glTF with tex coords
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -33,6 +36,17 @@ pub struct GltfRenderer {
     pub render_pass: vk::RenderPass,
     pub framebuffers: Vec<vk::Framebuffer>,
 
+    // Cascaded shadow maps (depth array)
+    pub shadow_image: vk::Image,
+    pub shadow_image_view: vk::ImageView, // 2D array view for sampling
+    pub shadow_layer_views: Vec<vk::ImageView>,
+    pub shadow_allocation: Option<Allocation>,
+    pub shadow_sampler: vk::Sampler,
+    pub shadow_render_pass: vk::RenderPass,
+    pub shadow_framebuffers: Vec<vk::Framebuffer>,
+    pub shadow_pipeline: vk::Pipeline,
+    pub shadow_pipeline_layout: vk::PipelineLayout,
+
     pub ground_model: Mat4,
     pub duck_model: Mat4,
 }
@@ -45,6 +59,14 @@ pub struct GltfPushConstants {
     pub _pad: [i32; 3],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ShadowPushConstants {
+    pub model: [[f32; 4]; 4],
+    pub cascade_index: i32,
+    pub _pad: [i32; 3],
+}
+
 // Must match shaders/gltf.vert + shaders/gltf.frag
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -53,6 +75,14 @@ pub struct GltfUniformBufferObject {
     pub proj: [[f32; 4]; 4],
     pub camera_pos: [f32; 4],
     pub light_dir: [f32; 4],
+
+    // Cascaded shadow maps
+    pub light_view_proj: [[[f32; 4]; 4]; SHADOW_CASCADE_COUNT],
+    pub cascade_splits: [f32; 4],
+    pub shadow_map_size: [f32; 4],
+
+    pub debug_flags: [f32; 4],
+    pub shadow_bias: [f32; 4],
 }
 
 pub struct GltfMeshBuffers {
@@ -117,8 +147,28 @@ impl GltfRenderer {
             // Create a white 1x1 fallback texture
             Some(Self::create_fallback_texture(renderer)?)
         };
+
+        // Create cascaded shadow map resources (depth array)
+        let (shadow_image, shadow_image_view, shadow_layer_views, shadow_allocation, shadow_sampler) =
+            Self::create_shadow_resources(renderer, depth_format)?;
+
+        // Initialize the shadow image into a known layout so per-frame transitions are valid.
+        Self::transition_depth_image_layout_array(
+            renderer,
+            shadow_image,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            SHADOW_CASCADE_COUNT as u32,
+        )?;
+
+        let shadow_render_pass = Self::create_shadow_render_pass(&renderer.device, depth_format)?;
+        let shadow_framebuffers = Self::create_shadow_framebuffers(
+            &renderer.device,
+            shadow_render_pass,
+            &shadow_layer_views,
+        )?;
         
-        // Create descriptor set layout (UBO + sampler)
+        // Create descriptor set layout (UBO + albedo sampler + shadow sampler)
         let ubo_binding = vk::DescriptorSetLayoutBinding::default()
             .binding(0)
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
@@ -130,8 +180,14 @@ impl GltfRenderer {
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+
+        let shadow_binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(2)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT);
         
-        let bindings = [ubo_binding, sampler_binding];
+        let bindings = [ubo_binding, sampler_binding, shadow_binding];
         let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
         let descriptor_set_layout = renderer.device.create_descriptor_set_layout(&layout_info, None)?;
         
@@ -148,6 +204,24 @@ impl GltfRenderer {
         
         // Create pipeline
         let pipeline = Self::create_pipeline(&renderer.device, render_pass, pipeline_layout)?;
+
+        // Create shadow pipeline layout + pipeline
+        let shadow_push_constant_range = vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .offset(0)
+            .size(std::mem::size_of::<ShadowPushConstants>() as u32);
+        let shadow_pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(std::slice::from_ref(&descriptor_set_layout))
+            .push_constant_ranges(std::slice::from_ref(&shadow_push_constant_range));
+        let shadow_pipeline_layout = renderer
+            .device
+            .create_pipeline_layout(&shadow_pipeline_layout_info, None)?;
+
+        let shadow_pipeline = Self::create_shadow_pipeline(
+            &renderer.device,
+            shadow_render_pass,
+            shadow_pipeline_layout,
+        )?;
         
         // Create descriptor pool
         let pool_sizes = [
@@ -157,7 +231,8 @@ impl GltfRenderer {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                descriptor_count: MAX_FRAMES_IN_FLIGHT as u32,
+                // binding=1 (albedo) + binding=2 (shadow)
+                descriptor_count: (MAX_FRAMES_IN_FLIGHT * 2) as u32,
             },
         ];
         
@@ -212,6 +287,12 @@ impl GltfRenderer {
                 image_view: texture.as_ref().unwrap().image_view,
                 image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
             };
+
+            let shadow_image_info = vk::DescriptorImageInfo {
+                sampler: shadow_sampler,
+                image_view: shadow_image_view,
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            };
             
             let descriptor_writes = [
                 vk::WriteDescriptorSet::default()
@@ -224,6 +305,11 @@ impl GltfRenderer {
                     .dst_binding(1)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .image_info(std::slice::from_ref(&image_info)),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_sets[i])
+                    .dst_binding(2)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(&shadow_image_info)),
             ];
             
             renderer.device.update_descriptor_sets(&descriptor_writes, &[]);
@@ -341,6 +427,16 @@ impl GltfRenderer {
             depth_allocations,
             render_pass,
             framebuffers,
+
+            shadow_image,
+            shadow_image_view,
+            shadow_layer_views,
+            shadow_allocation: Some(shadow_allocation),
+            shadow_sampler,
+            shadow_render_pass,
+            shadow_framebuffers,
+            shadow_pipeline,
+            shadow_pipeline_layout,
 
             ground_model: Mat4::IDENTITY,
             duck_model: Mat4::IDENTITY,
@@ -463,6 +559,265 @@ impl GltfRenderer {
         let image_view = renderer.device.create_image_view(&view_info, None)?;
         
         Ok((image, image_view, allocation))
+    }
+
+    unsafe fn create_shadow_resources(
+        renderer: &VulkanRenderer,
+        format: vk::Format,
+    ) -> Result<(vk::Image, vk::ImageView, Vec<vk::ImageView>, Allocation, vk::Sampler), Box<dyn std::error::Error>> {
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width: SHADOW_MAP_SIZE,
+                height: SHADOW_MAP_SIZE,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(SHADOW_CASCADE_COUNT as u32)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+
+        let image = renderer.device.create_image(&image_info, None)?;
+        let requirements = renderer.device.get_image_memory_requirements(image);
+
+        let allocation = renderer.allocator.lock().allocate(&AllocationCreateDesc {
+            name: "shadow_map",
+            requirements,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })?;
+
+        renderer
+            .device
+            .bind_image_memory(image, allocation.memory(), allocation.offset())?;
+
+        let range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::DEPTH,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: SHADOW_CASCADE_COUNT as u32,
+        };
+
+        let array_view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D_ARRAY)
+            .format(format)
+            .subresource_range(range);
+        let array_view = renderer.device.create_image_view(&array_view_info, None)?;
+
+        let mut layer_views = Vec::with_capacity(SHADOW_CASCADE_COUNT);
+        for layer in 0..SHADOW_CASCADE_COUNT {
+            let layer_view_info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(format)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::DEPTH,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: layer as u32,
+                    layer_count: 1,
+                });
+            layer_views.push(renderer.device.create_image_view(&layer_view_info, None)?);
+        }
+
+        // Shadow sampler with hardware comparison (fast PCF!)
+        let sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+            .border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE)
+            .compare_enable(true)
+            .compare_op(vk::CompareOp::LESS_OR_EQUAL)
+            .min_lod(0.0)
+            .max_lod(0.0);
+        let sampler = renderer.device.create_sampler(&sampler_info, None)?;
+
+        Ok((image, array_view, layer_views, allocation, sampler))
+    }
+
+    unsafe fn create_shadow_render_pass(
+        device: &ash::Device,
+        depth_format: vk::Format,
+    ) -> Result<vk::RenderPass, vk::Result> {
+        let attachment = vk::AttachmentDescription::default()
+            .format(depth_format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+            .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
+        let depth_ref = vk::AttachmentReference {
+            attachment: 0,
+            layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        };
+
+        let subpass = vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .depth_stencil_attachment(&depth_ref);
+
+        let dependency = vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS)
+            .dst_stage_mask(vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS)
+            .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE);
+
+        let render_pass_info = vk::RenderPassCreateInfo::default()
+            .attachments(std::slice::from_ref(&attachment))
+            .subpasses(std::slice::from_ref(&subpass))
+            .dependencies(std::slice::from_ref(&dependency));
+
+        device.create_render_pass(&render_pass_info, None)
+    }
+
+    unsafe fn create_shadow_framebuffers(
+        device: &ash::Device,
+        render_pass: vk::RenderPass,
+        layer_views: &[vk::ImageView],
+    ) -> Result<Vec<vk::Framebuffer>, vk::Result> {
+        layer_views
+            .iter()
+            .map(|&view| {
+                let attachments = [view];
+                let framebuffer_info = vk::FramebufferCreateInfo::default()
+                    .render_pass(render_pass)
+                    .attachments(&attachments)
+                    .width(SHADOW_MAP_SIZE)
+                    .height(SHADOW_MAP_SIZE)
+                    .layers(1);
+                device.create_framebuffer(&framebuffer_info, None)
+            })
+            .collect()
+    }
+
+    unsafe fn create_shadow_pipeline(
+        device: &ash::Device,
+        render_pass: vk::RenderPass,
+        pipeline_layout: vk::PipelineLayout,
+    ) -> Result<vk::Pipeline, Box<dyn std::error::Error>> {
+        let vert_code = include_bytes!("../shaders/shadow.vert.spv");
+        let frag_code = include_bytes!("../shaders/shadow.frag.spv");
+
+        let vert_module = Self::create_shader_module(device, vert_code)?;
+        let frag_module = Self::create_shader_module(device, frag_code)?;
+
+        let main_name = CString::new("main")?;
+
+        let shader_stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vert_module)
+                .name(&main_name),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(frag_module)
+                .name(&main_name),
+        ];
+
+        let binding = vk::VertexInputBindingDescription::default()
+            .binding(0)
+            .stride(std::mem::size_of::<GltfVertex>() as u32)
+            .input_rate(vk::VertexInputRate::VERTEX);
+
+        let attributes = [
+            vk::VertexInputAttributeDescription {
+                binding: 0,
+                location: 0,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: 0,
+            },
+            vk::VertexInputAttributeDescription {
+                binding: 0,
+                location: 1,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: 12,
+            },
+            vk::VertexInputAttributeDescription {
+                binding: 0,
+                location: 2,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: 24,
+            },
+            vk::VertexInputAttributeDescription {
+                binding: 0,
+                location: 3,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: 36,
+            },
+        ];
+
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(std::slice::from_ref(&binding))
+            .vertex_attribute_descriptions(&attributes);
+
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+
+        let dynamic_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+        ];
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+
+        // No depth bias needed - using linear+point sampling trick instead
+        let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .line_width(1.0)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .depth_bias_enable(false);
+
+        let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+        let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
+            .depth_bounds_test_enable(false)
+            .stencil_test_enable(false);
+
+        let color_blending = vk::PipelineColorBlendStateCreateInfo::default().attachments(&[]);
+
+        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&shader_stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterizer)
+            .multisample_state(&multisampling)
+            .depth_stencil_state(&depth_stencil)
+            .color_blend_state(&color_blending)
+            .dynamic_state(&dynamic_state)
+            .layout(pipeline_layout)
+            .render_pass(render_pass)
+            .subpass(0);
+
+        let pipeline = device
+            .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+            .map_err(|(_, e)| e)?[0];
+
+        device.destroy_shader_module(vert_module, None);
+        device.destroy_shader_module(frag_module, None);
+
+        Ok(pipeline)
     }
     
     unsafe fn create_render_pass(
@@ -893,6 +1248,76 @@ impl GltfRenderer {
         
         Ok(())
     }
+
+    unsafe fn transition_depth_image_layout_array(
+        renderer: &VulkanRenderer,
+        image: vk::Image,
+        old_layout: vk::ImageLayout,
+        new_layout: vk::ImageLayout,
+        layer_count: u32,
+    ) -> Result<(), vk::Result> {
+        let cmd_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(renderer.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+
+        let cmd = renderer.device.allocate_command_buffers(&cmd_info)?[0];
+
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        renderer.device.begin_command_buffer(cmd, &begin_info)?;
+
+        let (src_access, dst_access, src_stage, dst_stage) = match (old_layout, new_layout) {
+            (vk::ImageLayout::UNDEFINED, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL) => (
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::SHADER_READ,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+            ),
+            _ => (
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::empty(),
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+            ),
+        };
+
+        let barrier = vk::ImageMemoryBarrier::default()
+            .old_layout(old_layout)
+            .new_layout(new_layout)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::DEPTH,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count,
+            })
+            .src_access_mask(src_access)
+            .dst_access_mask(dst_access);
+
+        renderer.device.cmd_pipeline_barrier(
+            cmd,
+            src_stage,
+            dst_stage,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier],
+        );
+
+        renderer.device.end_command_buffer(cmd)?;
+
+        let submit_info = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+        renderer.device.queue_submit(renderer.graphics_queue, &[submit_info], vk::Fence::null())?;
+        renderer.device.queue_wait_idle(renderer.graphics_queue)?;
+
+        renderer.device.free_command_buffers(renderer.command_pool, &[cmd]);
+
+        Ok(())
+    }
     
     unsafe fn copy_buffer_to_image(
         renderer: &VulkanRenderer,
@@ -955,6 +1380,7 @@ impl GltfRenderer {
         camera_fov: f32,
         scale: f32,
         aspect_ratio: f32,
+        debug_cascades: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Calculate camera direction from yaw and pitch
         let camera_front = glam::Vec3::new(
@@ -978,6 +1404,103 @@ impl GltfRenderer {
         // many helper functions. Flip Y so "up" on input corresponds to "up" on screen.
         let mut proj = glam::Mat4::perspective_rh(camera_fov, aspect_ratio, 0.1, 100.0);
         proj.y_axis.y *= -1.0;
+
+        // Cascaded shadow maps (4 splits)
+        let near_plane = 0.1_f32;
+        let far_plane = 100.0_f32;
+        let lambda = 0.6_f32;
+
+        let mut cascade_splits = [0.0_f32; 4];
+        for i in 0..SHADOW_CASCADE_COUNT {
+            let p = (i as f32 + 1.0) / SHADOW_CASCADE_COUNT as f32;
+            let log = near_plane * (far_plane / near_plane).powf(p);
+            let uni = near_plane + (far_plane - near_plane) * p;
+            cascade_splits[i] = lambda * log + (1.0 - lambda) * uni;
+        }
+
+        let inv_view_proj = (proj * view).inverse();
+        let ndc = [
+            glam::Vec3::new(-1.0, -1.0, 0.0),
+            glam::Vec3::new( 1.0, -1.0, 0.0),
+            glam::Vec3::new( 1.0,  1.0, 0.0),
+            glam::Vec3::new(-1.0,  1.0, 0.0),
+            glam::Vec3::new(-1.0, -1.0, 1.0),
+            glam::Vec3::new( 1.0, -1.0, 1.0),
+            glam::Vec3::new( 1.0,  1.0, 1.0),
+            glam::Vec3::new(-1.0,  1.0, 1.0),
+        ];
+
+        let mut frustum_corners = [glam::Vec3::ZERO; 8];
+        for (i, c) in ndc.iter().enumerate() {
+            let p = inv_view_proj * glam::Vec4::new(c.x, c.y, c.z, 1.0);
+            frustum_corners[i] = (p / p.w).truncate();
+        }
+
+        let light_dir_world = glam::Vec3::new(0.5, 1.0, 0.3).normalize();
+        let mut light_view_proj = [[[0.0_f32; 4]; 4]; SHADOW_CASCADE_COUNT];
+
+        let mut prev_split = near_plane;
+        for cascade in 0..SHADOW_CASCADE_COUNT {
+            let split = cascade_splits[cascade];
+            let t0 = ((prev_split - near_plane) / (far_plane - near_plane)).clamp(0.0, 1.0);
+            let t1 = ((split - near_plane) / (far_plane - near_plane)).clamp(0.0, 1.0);
+
+            let mut corners = [glam::Vec3::ZERO; 8];
+            for i in 0..4 {
+                let near_corner = frustum_corners[i];
+                let far_corner = frustum_corners[i + 4];
+                corners[i] = near_corner + (far_corner - near_corner) * t0;
+                corners[i + 4] = near_corner + (far_corner - near_corner) * t1;
+            }
+
+            let mut center = glam::Vec3::ZERO;
+            for c in &corners {
+                center += *c;
+            }
+            center /= 8.0;
+
+            // Fit bounds in light space
+            let up = if light_dir_world.dot(glam::Vec3::Y).abs() > 0.9 {
+                glam::Vec3::Z
+            } else {
+                glam::Vec3::Y
+            };
+
+            // Place the directional light far enough so the ortho near plane stays sane.
+            // (Distance is based on cascade radius.)
+            let mut radius = 0.0_f32;
+            for c in &corners {
+                radius = radius.max((*c - center).length());
+            }
+            radius = radius.max(1.0);
+            let light_pos = center + light_dir_world * (radius * 2.5);
+            let light_view = glam::Mat4::look_at_rh(light_pos, center, up);
+
+            let mut min = glam::Vec3::splat(f32::INFINITY);
+            let mut max = glam::Vec3::splat(f32::NEG_INFINITY);
+            for c in &corners {
+                let ls = (light_view * glam::Vec4::new(c.x, c.y, c.z, 1.0)).truncate();
+                min = min.min(ls);
+                max = max.max(ls);
+            }
+
+            let pad_xy = radius * 0.05;
+            let left = min.x - pad_xy;
+            let right = max.x + pad_xy;
+            let bottom = min.y - pad_xy;
+            let top = max.y + pad_xy;
+
+            // Convert light-space z (RH look_at => forward is -Z) to positive distances.
+            let pad_z = radius * 0.2;
+            let near_dist = (-max.z - pad_z).max(0.1);
+            let far_dist = (-min.z + pad_z).max(near_dist + 0.1);
+
+            let light_proj = glam::Mat4::orthographic_rh(left, right, bottom, top, near_dist, far_dist);
+            let vp = light_proj * light_view;
+            light_view_proj[cascade] = vp.to_cols_array_2d();
+
+            prev_split = split;
+        }
         
         let ubo = GltfUniformBufferObject {
             view: view.to_cols_array_2d(),
@@ -987,6 +1510,18 @@ impl GltfRenderer {
                 let l = glam::Vec4::new(0.5, 1.0, 0.3, 0.0).normalize();
                 [l.x, l.y, l.z, l.w]
             },
+
+            light_view_proj,
+            cascade_splits,
+            shadow_map_size: [
+                SHADOW_MAP_SIZE as f32,
+                SHADOW_MAP_SIZE as f32,
+                1.0 / SHADOW_MAP_SIZE as f32,
+                1.0 / SHADOW_MAP_SIZE as f32,
+            ],
+
+            debug_flags: [if debug_cascades { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+            shadow_bias: [0.0, 0.0, 0.0, 0.0], // Not used - linear+point sampling eliminates bias
         };
         
         if let Some(allocation) = &self.uniform_allocations[current_frame] {
@@ -998,13 +1533,190 @@ impl GltfRenderer {
     }
     
     pub unsafe fn render(
-        &self,
+        &mut self,
         device: &ash::Device,
         command_buffer: vk::CommandBuffer,
         extent: vk::Extent2D,
         image_index: u32,
         current_frame: usize,
     ) {
+        // --- Shadow pass (CSM) ---
+        {
+            let old_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+            let src_stage = vk::PipelineStageFlags::FRAGMENT_SHADER;
+            let src_access = vk::AccessFlags::SHADER_READ;
+
+            let barrier_to_depth = vk::ImageMemoryBarrier::default()
+                .old_layout(old_layout)
+                .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                .src_access_mask(src_access)
+                .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(self.shadow_image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::DEPTH,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: SHADOW_CASCADE_COUNT as u32,
+                });
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                src_stage,
+                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&barrier_to_depth),
+            );
+
+            let shadow_viewport = vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: SHADOW_MAP_SIZE as f32,
+                height: SHADOW_MAP_SIZE as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            };
+            let shadow_scissor = vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D {
+                    width: SHADOW_MAP_SIZE,
+                    height: SHADOW_MAP_SIZE,
+                },
+            };
+
+            unsafe fn push_shadow(
+                device: &ash::Device,
+                command_buffer: vk::CommandBuffer,
+                pipeline_layout: vk::PipelineLayout,
+                model: &Mat4,
+                cascade_index: i32,
+            ) {
+                let pc = ShadowPushConstants {
+                    model: model.to_cols_array_2d(),
+                    cascade_index,
+                    _pad: [0; 3],
+                };
+                let bytes = std::slice::from_raw_parts(
+                    (&pc as *const ShadowPushConstants) as *const u8,
+                    std::mem::size_of::<ShadowPushConstants>(),
+                );
+                device.cmd_push_constants(
+                    command_buffer,
+                    pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    bytes,
+                );
+            }
+
+            for cascade in 0..SHADOW_CASCADE_COUNT {
+                let clear_values = [vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 },
+                }];
+                let render_pass_info = vk::RenderPassBeginInfo::default()
+                    .render_pass(self.shadow_render_pass)
+                    .framebuffer(self.shadow_framebuffers[cascade])
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: vk::Extent2D {
+                            width: SHADOW_MAP_SIZE,
+                            height: SHADOW_MAP_SIZE,
+                        },
+                    })
+                    .clear_values(&clear_values);
+
+                device.cmd_begin_render_pass(
+                    command_buffer,
+                    &render_pass_info,
+                    vk::SubpassContents::INLINE,
+                );
+                device.cmd_bind_pipeline(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.shadow_pipeline,
+                );
+                device.cmd_set_viewport(command_buffer, 0, &[shadow_viewport]);
+                device.cmd_set_scissor(command_buffer, 0, &[shadow_scissor]);
+
+                device.cmd_bind_descriptor_sets(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.shadow_pipeline_layout,
+                    0,
+                    &[self.descriptor_sets[current_frame]],
+                    &[],
+                );
+
+                // Draw ground
+                if let Some(ground) = &self.ground {
+                    push_shadow(
+                        device,
+                        command_buffer,
+                        self.shadow_pipeline_layout,
+                        &self.ground_model,
+                        cascade as i32,
+                    );
+                    device.cmd_bind_vertex_buffers(command_buffer, 0, &[ground.vertex_buffer], &[0]);
+                    device.cmd_bind_index_buffer(
+                        command_buffer,
+                        ground.index_buffer,
+                        0,
+                        vk::IndexType::UINT32,
+                    );
+                    device.cmd_draw_indexed(command_buffer, ground.index_count, 1, 0, 0, 0);
+                }
+
+                // Draw duck
+                push_shadow(
+                    device,
+                    command_buffer,
+                    self.shadow_pipeline_layout,
+                    &self.duck_model,
+                    cascade as i32,
+                );
+                for mesh in &self.meshes {
+                    device.cmd_bind_vertex_buffers(command_buffer, 0, &[mesh.vertex_buffer], &[0]);
+                    device.cmd_bind_index_buffer(
+                        command_buffer,
+                        mesh.index_buffer,
+                        0,
+                        vk::IndexType::UINT32,
+                    );
+                    device.cmd_draw_indexed(command_buffer, mesh.index_count, 1, 0, 0, 0);
+                }
+
+                device.cmd_end_render_pass(command_buffer);
+            }
+
+            let barrier_to_sample = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(self.shadow_image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::DEPTH,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: SHADOW_CASCADE_COUNT as u32,
+                });
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&barrier_to_sample),
+            );
+        }
+
         // Begin render pass
         let clear_values = [
             vk::ClearValue {
@@ -1157,6 +1869,24 @@ impl GltfRenderer {
             if let Some(alloc) = allocation.take() {
                 let _ = renderer.allocator.lock().free(alloc);
             }
+        }
+
+        // Cleanup shadow map resources
+        for &fb in &self.shadow_framebuffers {
+            renderer.device.destroy_framebuffer(fb, None);
+        }
+        renderer.device.destroy_render_pass(self.shadow_render_pass, None);
+        renderer.device.destroy_pipeline(self.shadow_pipeline, None);
+        renderer.device.destroy_pipeline_layout(self.shadow_pipeline_layout, None);
+
+        renderer.device.destroy_sampler(self.shadow_sampler, None);
+        for &view in &self.shadow_layer_views {
+            renderer.device.destroy_image_view(view, None);
+        }
+        renderer.device.destroy_image_view(self.shadow_image_view, None);
+        renderer.device.destroy_image(self.shadow_image, None);
+        if let Some(allocation) = self.shadow_allocation.take() {
+            let _ = renderer.allocator.lock().free(allocation);
         }
         
         // Cleanup framebuffers

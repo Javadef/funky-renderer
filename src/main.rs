@@ -151,6 +151,12 @@ impl Default for SceneObjects {
     }
 }
 
+#[derive(Resource, Clone, Copy, Default)]
+pub struct ShadowSettings {
+    pub debug_cascades: bool,
+    // Linear+point sampling trick eliminates the need for bias!
+}
+
 // ============================================================================
 // SYSTEMS
 // ============================================================================
@@ -225,6 +231,7 @@ impl App {
         world.insert_resource(FrameTiming::default());
         world.insert_resource(CameraController::default());
         world.insert_resource(SceneObjects::default());
+        world.insert_resource(ShadowSettings::default());
         
         let mut startup_schedule = Schedule::default();
         startup_schedule.add_systems(setup_scene);
@@ -666,6 +673,8 @@ impl App {
                 (objects.gltf_scale, objects.gltf_min_y)
             };
 
+            let shadow_settings = *self.world.resource::<ShadowSettings>();
+
             // Put the duck on the ground plane (Y=0). Account for user scale.
             let duck_pos = glam::Vec3::new(0.0, -gltf_min_y * gltf_scale, 0.0);
             let duck_pos = duck_pos + glam::Vec3::new(0.0, 0.001, 0.0);
@@ -682,6 +691,7 @@ impl App {
                     camera_fov,
                     gltf_scale,
                     aspect_ratio,
+                    shadow_settings.debug_cascades,
                 ) {
                     eprintln!("Failed to update glTF uniform buffer: {}", e);
                 }
@@ -724,6 +734,8 @@ impl App {
                         let objects = self.world.resource::<SceneObjects>();
                         objects.gltf_scale
                     };
+
+                    let shadow_settings = *self.world.resource::<ShadowSettings>();
                     
                     let ui_data = UiData {
                         fps,
@@ -733,14 +745,19 @@ impl App {
                         vulkan_version: renderer.vulkan_version.clone(),
                         gpu_name: renderer.gpu_name.clone(),
                         gltf_scale: current_gltf_scale,
+                        shadow_debug_cascades: shadow_settings.debug_cascades,
                     };
-                    
-                    let (full_output, scale_changed) = egui_int.build_ui(window, &ui_data);
-                    
-                    // Apply scale changes from UI
-                    if let Some((_, new_gltf_scale)) = scale_changed {
+
+                    let (full_output, ui_changes) = egui_int.build_ui(window, &ui_data);
+
+                    if let Some(new_gltf_scale) = ui_changes.gltf_scale {
                         let mut objects = self.world.resource_mut::<SceneObjects>();
                         objects.gltf_scale = new_gltf_scale;
+                    }
+
+                    if ui_changes.shadow_settings_changed {
+                        let mut s = self.world.resource_mut::<ShadowSettings>();
+                        s.debug_cascades = ui_changes.shadow_debug_cascades;
                     }
 
                     // Keep Vulkan font atlas in sync with egui

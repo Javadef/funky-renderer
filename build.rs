@@ -73,4 +73,24 @@ fn main() {
         Ok(s) if s.success() => println!("cargo:warning=egui fragment shader compiled"),
         _ => println!("cargo:warning=egui fragment shader compile failed"),
     }
+
+    // Compile shadow map vertex shader
+    let status = Command::new(&glslc)
+        .args(&["shaders/shadow.vert", "-o", "shaders/shadow.vert.spv"])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => println!("cargo:warning=Shadow vertex shader compiled"),
+        _ => println!("cargo:warning=Shadow vertex shader compile failed - using existing .spv"),
+    }
+
+    // Compile shadow map fragment shader
+    let status = Command::new(&glslc)
+        .args(&["shaders/shadow.frag", "-o", "shaders/shadow.frag.spv"])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => println!("cargo:warning=Shadow fragment shader compiled"),
+        _ => println!("cargo:warning=Shadow fragment shader compile failed - using existing .spv"),
+    }
 }
