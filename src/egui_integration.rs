@@ -43,15 +43,19 @@ impl EguiIntegration {
         self.ui_visible = !self.ui_visible;
     }
     
-    /// Build the UI and return FullOutput
-    pub fn build_ui(&mut self, window: &Window, ui_data: &UiData) -> egui::FullOutput {
+    /// Build the UI and return FullOutput and optional scale changes
+    pub fn build_ui(&mut self, window: &Window, ui_data: &UiData) -> (egui::FullOutput, Option<(f32, f32)>) {
         let raw_input = self.state.take_egui_input(window);
         
-        self.ctx.run(raw_input, |ctx| {
+        let mut scale_changed = None;
+        
+        let output = self.ctx.run(raw_input, |ctx| {
             if self.ui_visible {
-                render_debug_ui(ctx, ui_data);
+                scale_changed = render_debug_ui(ctx, ui_data);
             }
-        })
+        });
+        
+        (output, scale_changed)
     }
 }
 
@@ -63,6 +67,8 @@ pub struct UiData {
     pub component_counts: ComponentCounts,
     pub vulkan_version: String,
     pub gpu_name: String,
+    pub cube_scale: f32,
+    pub gltf_scale: f32,
 }
 
 pub struct ComponentCounts {
@@ -72,12 +78,39 @@ pub struct ComponentCounts {
     pub renderables: usize,
 }
 
-fn render_debug_ui(ctx: &egui::Context, data: &UiData) {
+fn render_debug_ui(ctx: &egui::Context, data: &UiData) -> Option<(f32, f32)> {
+    let mut scale_changed = None;
+    
     egui::Window::new("🎮 Funky Renderer Debug")
         .default_pos([10.0, 10.0])
         .default_width(300.0)
         .show(ctx, |ui| {
             ui.heading("Performance");
+            ui.separator();
+            
+            ui.horizontal(|ui| {
+                ui.label("FPS:");
+                ui.colored_label(egui::Color32::GREEN, format!("{:.1}", data.fps));
+            });
+            
+            ui.horizontal(|ui| {
+                ui.label("Frame Time:");
+                ui.colored_label(egui::Color32::LIGHT_BLUE, format!("{:.2} ms", data.frame_time_ms));
+            });
+            
+            ui.add_space(10.0);
+            ui.heading("Scene Objects");
+            ui.separator();
+            
+            let mut gltf_scale = data.gltf_scale;
+            
+            ui.label("Duck Scale:");
+            if ui.add(egui::Slider::new(&mut gltf_scale, 0.01..=2.0).text("scale")).changed() {
+                scale_changed = Some((1.0, gltf_scale));
+            }
+            
+            ui.add_space(10.0);
+            ui.heading("Bevy ECS Stats");
             ui.separator();
             
             ui.horizontal(|ui| {
@@ -115,4 +148,6 @@ fn render_debug_ui(ctx: &egui::Context, data: &UiData) {
             ui.label("🦀 Rust + Bevy ECS + ash (Vulkan)");
             ui.small("Press F3 to toggle UI");
         });
+    
+    scale_changed
 }

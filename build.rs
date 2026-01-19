@@ -14,24 +14,44 @@ fn main() {
     
     let glslc = format!("{}\\Bin\\glslc.exe", vulkan_sdk);
     
-    // Compile vertex shader
+    // Compile cube vertex shader
     let status = Command::new(&glslc)
         .args(&["shaders/cube.vert", "-o", "shaders/cube.vert.spv"])
         .status();
     
     match status {
-        Ok(s) if s.success() => println!("cargo:warning=Vertex shader compiled"),
-        _ => println!("cargo:warning=Vertex shader compile failed - using existing .spv"),
+        Ok(s) if s.success() => println!("cargo:warning=Cube vertex shader compiled"),
+        _ => println!("cargo:warning=Cube vertex shader compile failed - using existing .spv"),
     }
     
-    // Compile fragment shader
+    // Compile cube fragment shader
     let status = Command::new(&glslc)
         .args(&["shaders/cube.frag", "-o", "shaders/cube.frag.spv"])
         .status();
     
     match status {
-        Ok(s) if s.success() => println!("cargo:warning=Fragment shader compiled"),
-        _ => println!("cargo:warning=Fragment shader compile failed - using existing .spv"),
+        Ok(s) if s.success() => println!("cargo:warning=Cube fragment shader compiled"),
+        _ => println!("cargo:warning=Cube fragment shader compile failed - using existing .spv"),
+    }
+    
+    // Compile glTF vertex shader
+    let status = Command::new(&glslc)
+        .args(&["shaders/gltf.vert", "-o", "shaders/gltf.vert.spv"])
+        .status();
+    
+    match status {
+        Ok(s) if s.success() => println!("cargo:warning=glTF vertex shader compiled"),
+        _ => println!("cargo:warning=glTF vertex shader compile failed"),
+    }
+    
+    // Compile glTF fragment shader
+    let status = Command::new(&glslc)
+        .args(&["shaders/gltf.frag", "-o", "shaders/gltf.frag.spv"])
+        .status();
+    
+    match status {
+        Ok(s) if s.success() => println!("cargo:warning=glTF fragment shader compiled"),
+        _ => println!("cargo:warning=glTF fragment shader compile failed"),
     }
     
     // Compile egui vertex shader

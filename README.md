@@ -7,9 +7,11 @@ A high-performance custom Vulkan renderer built from scratch with HLSL shaders a
 ✨ **Custom Vulkan Renderer** - Built from scratch using Ash (Vulkan bindings)
 🎨 **HLSL Shaders** - Vertex and fragment shaders written in HLSL, compiled to SPIR-V
 🧊 **Rotating Cube** - Smooth 3D cube with per-face coloring
+📦 **glTF Scene Loading** - Load and render real 3D models from glTF/GLB files
 ⚡ **Multi-threading Support** - Rayon-based parallel command buffer recording
 🎮 **Real-time Performance** - 60+ FPS rendering with GPU synchronization
-🔄 **Bevy Integration Ready** - Optional ECS integration for advanced features
+🖥️ **egui Debug UI** - Built-in performance monitoring and system information
+🔄 **Bevy ECS Integration** - Entity Component System for game logic
 
 ## Architecture
 
@@ -59,16 +61,28 @@ funkyrenderer/
 ├── build.rs                # HLSL shader compilation
 ├── README.md               # This file
 ├── documentation.md        # Comprehensive learning guide
+├── GLTF_GUIDE.md          # glTF usage documentation
+├── GLTF_IMPLEMENTATION.md # glTF feature summary
 │
 ├── src/
 │   ├── main.rs            # Entry point & render loop
 │   ├── renderer.rs        # Vulkan renderer core
 │   ├── cube.rs            # Cube geometry & rendering
+│   ├── gltf_loader.rs     # glTF file loading
+│   ├── gltf_renderer.rs   # glTF rendering
+│   ├── egui_integration.rs # Debug UI integration
+│   ├── egui_vulkan.rs     # egui Vulkan backend
 │   └── multithreading.rs  # Multi-threading utilities
+│
+├── models/                # Place your glTF models here
+│   ├── scene.gltf        # Example rainbow cube
+│   └── scene.bin         # Binary data for example
 │
 └── shaders/
     ├── cube.vert.hlsl     # Vertex shader (HLSL)
-    └── cube.frag.hlsl     # Fragment shader (HLSL)
+    ├── cube.frag.hlsl     # Fragment shader (HLSL)
+    ├── egui.vert          # egui UI vertex shader
+    └── egui.frag          # egui UI fragment shader
 ```
 
 ## Prerequisites
@@ -116,6 +130,32 @@ You should see:
 
 **Controls:**
 - `ESC` or close window to exit
+- `F3` to toggle debug UI
+- `F11` to toggle fullscreen
+
+## glTF Model Loading 📦
+
+The renderer can load and display real 3D models in glTF format!
+
+**Quick Start:**
+1. Place a glTF model in `models/scene.gltf` (or `models/model.gltf`)
+2. Run the renderer - it will automatically detect and load the model
+3. The model renders alongside the spinning cube
+
+**Example model included:** A colorful rainbow cube at `models/scene.gltf`
+
+**Get more models:**
+- [Sketchfab](https://sketchfab.com/3d-models?features=downloadable) - Free downloadable models
+- [glTF Sample Models](https://github.com/KhronosGroup/glTF-Sample-Models) - Official test assets
+- Export from Blender: File → Export → glTF 2.0
+
+**Supported:**
+- ✅ glTF (.gltf) and GLB (.glb) formats
+- ✅ Multiple meshes, vertices, normals, colors
+- ✅ PBR materials (base color, metallic, roughness)
+- ✅ Index buffers for efficiency
+
+**For detailed glTF documentation, see [GLTF_GUIDE.md](GLTF_GUIDE.md)**
 
 ## How It Works
 

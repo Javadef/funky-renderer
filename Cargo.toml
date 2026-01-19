@@ -26,6 +26,10 @@ winit = "0.30"
 egui = "0.29"
 egui-winit = "0.29"
 
+# glTF loading
+gltf = { version = "1.4", features = ["names"] }
+image = "0.25"
+
 # System info
 sysinfo = "0.33"
 
@@ -40,3 +44,11 @@ opt-level = 2
 
 [profile.dev.package."*"]
 opt-level = 2
+
+[profile.release]
+# Maximize runtime performance (especially important for CPU-side driver/WSI overhead)
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = 0

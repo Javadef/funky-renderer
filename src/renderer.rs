@@ -31,6 +31,7 @@ pub struct VulkanRenderer {
     pub image_available_semaphores: Vec<vk::Semaphore>,
     pub render_finished_semaphores: Vec<vk::Semaphore>,
     pub in_flight_fences: Vec<vk::Fence>,
+    pub images_in_flight: Vec<vk::Fence>, // Track which fence is used by each swapchain image
     pub current_frame: usize,
     pub allocator: Arc<Mutex<Allocator>>,
     pub descriptor_set_layout: vk::DescriptorSetLayout,
@@ -228,15 +229,15 @@ impl VulkanRenderer {
             })
             .collect::<Result<Vec<_>, _>>()?;
         
-        // Create render pass
+        // Create render pass (for egui overlay - loads existing content)
         let color_attachment = vk::AttachmentDescription::default()
             .format(surface_format.format)
             .samples(vk::SampleCountFlags::TYPE_1)
-            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .load_op(vk::AttachmentLoadOp::LOAD)
             .store_op(vk::AttachmentStoreOp::STORE)
             .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
             .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .initial_layout(vk::ImageLayout::PRESENT_SRC_KHR)
             .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
         
         let color_attachment_ref = vk::AttachmentReference {
@@ -453,6 +454,9 @@ impl VulkanRenderer {
             in_flight_fences.push(device.create_fence(&fence_info, None)?);
         }
         
+        // Initialize images_in_flight to track which fence each swapchain image is using
+        let images_in_flight = vec![vk::Fence::null(); swapchain_images.len()];
+        
         Ok(Self {
             entry,
             instance,
@@ -477,6 +481,7 @@ impl VulkanRenderer {
             image_available_semaphores,
             render_finished_semaphores,
             in_flight_fences,
+            images_in_flight,
             current_frame: 0,
             allocator,
             descriptor_set_layout,
@@ -598,6 +603,9 @@ impl VulkanRenderer {
                 self.device.create_framebuffer(&framebuffer_info, None)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        
+        // Reset images_in_flight for the new swapchain images
+        self.images_in_flight = vec![vk::Fence::null(); self.swapchain_images.len()];
         
         self.framebuffer_resized = false;
         

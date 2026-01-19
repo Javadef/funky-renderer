@@ -168,20 +168,33 @@ impl CubeRenderer {
         renderer: &VulkanRenderer,
         frame_index: usize,
         rotation: f32,
+        position: glam::Vec3,
+        camera_pos: glam::Vec3,
+        camera_yaw: f32,
+        camera_pitch: f32,
+        camera_fov: f32,
+        scale: f32,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let aspect = renderer.swapchain_extent.width as f32 / renderer.swapchain_extent.height as f32;
         
-        let model = glam::Mat4::from_rotation_y(rotation) * glam::Mat4::from_rotation_x(rotation * 0.5);
+        let model = glam::Mat4::from_translation(position) 
+            * glam::Mat4::from_rotation_y(rotation) 
+            * glam::Mat4::from_rotation_x(rotation * 0.5)
+            * glam::Mat4::from_scale(glam::Vec3::splat(scale));
         
-        // Camera position for lighting calculations
-        let camera_pos = glam::Vec3::new(2.0, 2.0, 2.0);
+        // Calculate look-at target based on camera rotation
+        let target = camera_pos + glam::Vec3::new(
+            camera_yaw.sin() * camera_pitch.cos(),
+            camera_pitch.sin(),
+            camera_yaw.cos() * camera_pitch.cos(),
+        );
         
         let view = glam::Mat4::look_at_rh(
             camera_pos,
-            glam::Vec3::ZERO,
+            target,
             glam::Vec3::Y,
         );
-        let mut proj = glam::Mat4::perspective_rh(45.0_f32.to_radians(), aspect, 0.1, 10.0);
+        let mut proj = glam::Mat4::perspective_rh(camera_fov, aspect, 0.1, 100.0);
         // Vulkan clip space has inverted Y
         proj.y_axis.y *= -1.0;
         

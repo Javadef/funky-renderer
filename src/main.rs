@@ -7,11 +7,14 @@ mod cube;
 mod multithreading;
 mod egui_integration;
 mod egui_vulkan;
+mod gltf_loader;
+mod gltf_renderer;
 
 use renderer::VulkanRenderer;
-use cube::CubeRenderer;
 use egui_integration::{EguiIntegration, UiData, ComponentCounts};
 use egui_vulkan::EguiVulkanRenderer;
+use gltf_loader::GltfScene;
+use gltf_renderer::GltfRenderer;
 use ash::vk;
 use std::time::Instant;
 use winit::{
@@ -59,6 +62,11 @@ pub struct SpinningCube;
 pub struct Renderable;
 
 #[derive(Component)]
+pub struct GltfModel {
+    pub path: String,
+}
+
+#[derive(Component)]
 pub struct Camera {
     pub fov: f32,
     pub near: f32,
@@ -95,6 +103,46 @@ impl Default for FrameTiming {
     }
 }
 
+#[derive(Resource)]
+pub struct CameraController {
+    pub position: glam::Vec3,
+    pub yaw: f32,   // Rotation around Y axis
+    pub pitch: f32, // Rotation around X axis
+    pub fov: f32,   // Field of view for zoom
+    pub move_speed: f32,
+    pub rotate_speed: f32,
+    pub zoom_speed: f32,
+}
+
+impl Default for CameraController {
+    fn default() -> Self {
+        Self {
+            position: glam::Vec3::new(3.0, 2.0, 5.0),
+            yaw: 0.0,
+            pitch: 0.0,
+            fov: 45.0_f32.to_radians(),
+            move_speed: 5.0,
+            rotate_speed: 3.0, // Fast enough for comfortable 360° rotation
+            zoom_speed: 0.5,
+        }
+    }
+}
+
+#[derive(Resource)]
+pub struct SceneObjects {
+    pub cube_scale: f32,
+    pub gltf_scale: f32,
+}
+
+impl Default for SceneObjects {
+    fn default() -> Self {
+        Self {
+            cube_scale: 1.0,
+            gltf_scale: 0.3, // Duck is too big, start with smaller scale
+        }
+    }
+}
+
 // ============================================================================
 // SYSTEMS
 // ============================================================================
@@ -102,10 +150,15 @@ impl Default for FrameTiming {
 fn setup_scene(mut commands: Commands) {
     println!("🎬 Setting up scene with Bevy ECS...");
     commands.spawn((Camera::default(), Transform::new()));
+    
+    // Spawn spinning cube offset to the left
+    let mut cube_transform = Transform::new();
+    cube_transform.position = glam::Vec3::new(-2.0, 0.0, 0.0);
+    
     commands.spawn((
         SpinningCube,
         Renderable,
-        Transform::new(),
+        cube_transform,
         Velocity { linear: glam::Vec3::ZERO, angular: glam::Vec3::new(0.0, 1.0, 0.0) },
     ));
     println!("✓ Scene setup complete - 1 camera, 1 spinning cube");
@@ -148,7 +201,7 @@ fn update_performance_stats(mut stats: ResMut<PerformanceStats>) {
 struct App {
     window: Option<Window>,
     renderer: Option<VulkanRenderer>,
-    cube_renderer: Option<CubeRenderer>,
+    gltf_renderer: Option<GltfRenderer>,
     
     // Bevy ECS
     world: World,
@@ -162,6 +215,9 @@ struct App {
     
     last_frame_time: Instant,
     minimized: bool,
+    
+    // Input state
+    keys_pressed: std::collections::HashSet<KeyCode>,
 }
 
 impl App {
@@ -169,6 +225,8 @@ impl App {
         let mut world = World::new();
         world.insert_resource(PerformanceStats::default());
         world.insert_resource(FrameTiming::default());
+        world.insert_resource(CameraController::default());
+        world.insert_resource(SceneObjects::default());
         
         let mut startup_schedule = Schedule::default();
         startup_schedule.add_systems(setup_scene);
@@ -179,7 +237,7 @@ impl App {
         Self {
             window: None,
             renderer: None,
-            cube_renderer: None,
+            gltf_renderer: None,
             world,
             schedule,
             startup_schedule,
@@ -188,17 +246,85 @@ impl App {
             egui_vulkan: None,
             last_frame_time: Instant::now(),
             minimized: false,
+            keys_pressed: std::collections::HashSet::new(),
         }
     }
     
-    fn get_cube_rotation(&mut self) -> f32 {
-        let mut rotation_y = 0.0f32;
-        let mut query = self.world.query::<(&SpinningCube, &Transform)>();
-        for (_, transform) in query.iter(&self.world) {
-            let (yaw, _, _) = transform.rotation.to_euler(glam::EulerRot::YXZ);
-            rotation_y = yaw;
+    fn update_camera(&mut self) {
+        let delta = {
+            let timing = self.world.resource::<FrameTiming>();
+            timing.delta_time
+        };
+        
+        let mut camera = self.world.resource_mut::<CameraController>();
+        let speed = camera.move_speed * delta;
+        let rot_speed = camera.rotate_speed * delta;
+        
+        // Movement should match the same yaw/pitch convention used by the renderer.
+        // (Previously movement used a different yaw basis, which made A/D feel swapped
+        // and W/S not align with the camera view.)
+        let mut forward = glam::Vec3::new(
+            camera.yaw.cos() * camera.pitch.cos(),
+            0.0,
+            camera.yaw.sin() * camera.pitch.cos(),
+        );
+        if forward.length_squared() < 1e-6 {
+            forward = glam::Vec3::Z;
         }
-        rotation_y
+        forward = forward.normalize();
+
+        // Right-handed: right = forward x up
+        let right = forward.cross(glam::Vec3::Y).normalize();
+        
+        // WASD movement
+        if self.keys_pressed.contains(&KeyCode::KeyW) {
+            camera.position += forward * speed;
+        }
+        if self.keys_pressed.contains(&KeyCode::KeyS) {
+            camera.position -= forward * speed;
+        }
+        if self.keys_pressed.contains(&KeyCode::KeyA) {
+            camera.position -= right * speed;
+        }
+        if self.keys_pressed.contains(&KeyCode::KeyD) {
+            camera.position += right * speed;
+        }
+        
+        // QE for up/down
+        if self.keys_pressed.contains(&KeyCode::KeyQ) {
+            camera.position.y -= speed;
+        }
+        if self.keys_pressed.contains(&KeyCode::KeyE) {
+            camera.position.y += speed;
+        }
+        
+        // Arrow keys for rotation - yaw is unbounded for full 360° horizontal rotation
+        if self.keys_pressed.contains(&KeyCode::ArrowLeft) {
+            camera.yaw -= rot_speed;
+        }
+        if self.keys_pressed.contains(&KeyCode::ArrowRight) {
+            camera.yaw += rot_speed;
+        }
+
+        // Pitch is clamped to prevent gimbal lock / camera flip
+        const MAX_PITCH: f32 = 89.0_f32.to_radians();
+        if self.keys_pressed.contains(&KeyCode::ArrowUp) {
+            camera.pitch = (camera.pitch + rot_speed).clamp(-MAX_PITCH, MAX_PITCH);
+        }
+        if self.keys_pressed.contains(&KeyCode::ArrowDown) {
+            camera.pitch = (camera.pitch - rot_speed).clamp(-MAX_PITCH, MAX_PITCH);
+        }
+
+        // Keep yaw in [0, 2π) to avoid float precision issues over time
+        camera.yaw = camera.yaw.rem_euclid(std::f32::consts::TAU);
+        
+        // Z/X keys for zoom (adjust FOV)
+        if self.keys_pressed.contains(&KeyCode::KeyZ) {
+            camera.fov = (camera.fov - camera.zoom_speed * delta).clamp(10.0_f32.to_radians(), 120.0_f32.to_radians());
+        }
+        if self.keys_pressed.contains(&KeyCode::KeyX) {
+            camera.fov = (camera.fov + camera.zoom_speed * delta).clamp(10.0_f32.to_radians(), 120.0_f32.to_radians());
+        }
     }
     
     fn update_window_title(&self) {
@@ -237,14 +363,40 @@ impl ApplicationHandler for App {
                         renderer.swapchain_extent.width, 
                         renderer.swapchain_extent.height);
                     
-                    match CubeRenderer::new(&renderer) {
-                        Ok(cube) => {
-                            println!("✓ Cube geometry created");
-                            self.cube_renderer = Some(cube);
+                    // Load glTF scene (if available)
+                    let gltf_paths = [
+                        "models/scene.gltf",
+                        "models/model.gltf",
+                        "scene.gltf",
+                        "model.gltf",
+                    ];
+                    
+                    for path in &gltf_paths {
+                        if std::path::Path::new(path).exists() {
+                            println!("📦 Loading glTF scene from: {}", path);
+                            match GltfScene::load(path) {
+                                Ok(scene) => {
+                                    match GltfRenderer::new(&renderer, &scene) {
+                                        Ok(gltf_renderer) => {
+                                            println!("  ✓ glTF renderer created with textures");
+                                            self.gltf_renderer = Some(gltf_renderer);
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            eprintln!("  ✗ Failed to create glTF renderer: {}", e);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("  ✗ Failed to load glTF: {}", e);
+                                }
+                            }
+                            break;
                         }
-                        Err(e) => {
-                            eprintln!("✗ Failed to create cube: {}", e);
-                        }
+                    }
+                    
+                    if self.gltf_renderer.is_none() {
+                        println!("ℹ No glTF scene loaded. Place a model.gltf in the project root or models/ folder.");
                     }
                     
                     // Initialize egui
@@ -277,21 +429,33 @@ impl ApplicationHandler for App {
             self.startup_done = true;
         }
         
-        println!("\n🎮 Controls:");
-        println!("   ESC - Exit");
+        println!("\n🎮 Controls:");        println!("   WASD - Move camera");
+        println!("   Q/E - Move up/down");
+        println!("   Arrow Keys - Rotate camera");        println!("   ESC - Exit");
         println!("   F3 - Toggle UI");
         println!("   F11 - Toggle Fullscreen\n");
+        
+        // Request initial redraw
+        window.request_redraw();
         
         self.window = Some(window);
     }
     
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        // Let egui handle events first
-        if let Some(egui) = &mut self.egui_integration {
-            if let Some(window) = &self.window {
-                if egui.handle_event(window, &event) {
-                    return;
-                }
+        // Let egui handle events first. We still want to keep camera controls responsive,
+        // so we only suppress *key presses* when egui actively wants keyboard input.
+        let mut egui_consumed = false;
+        let mut egui_wants_keyboard = false;
+        if let (Some(egui), Some(window)) = (&mut self.egui_integration, &self.window) {
+            egui_consumed = egui.handle_event(window, &event);
+            egui_wants_keyboard = egui.ui_visible && egui.ctx.wants_keyboard_input();
+        }
+
+        // If egui consumed this event and it's not keyboard input, don't also handle it here.
+        // (We still handle keyboard input so camera controls remain usable.)
+        if egui_consumed {
+            if !matches!(event, WindowEvent::KeyboardInput { .. }) {
+                return;
             }
         }
         
@@ -301,32 +465,54 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state.is_pressed() {
-                    match event.physical_key {
-                        PhysicalKey::Code(KeyCode::Escape) => {
-                            self.cleanup();
-                            event_loop.exit();
+                if let PhysicalKey::Code(keycode) = event.physical_key {
+                    if event.state.is_pressed() {
+                        // Always allow app-level hotkeys, but avoid stealing input from egui
+                        // when it is editing a text field.
+                        let is_app_hotkey = matches!(keycode, KeyCode::Escape | KeyCode::F3 | KeyCode::F11);
+                        if is_app_hotkey || !egui_wants_keyboard {
+                            self.keys_pressed.insert(keycode);
                         }
-                        PhysicalKey::Code(KeyCode::F3) => {
-                            if let Some(egui) = &mut self.egui_integration {
-                                egui.toggle_ui();
+                        
+                        match keycode {
+                            KeyCode::Escape => {
+                                self.cleanup();
+                                event_loop.exit();
                             }
-                        }
-                        PhysicalKey::Code(KeyCode::F11) => {
-                            if let Some(window) = &self.window {
-                                let is_fullscreen = window.fullscreen().is_some();
-                                if is_fullscreen {
-                                    window.set_fullscreen(None);
-                                } else {
-                                    window.set_fullscreen(Some(
-                                        winit::window::Fullscreen::Borderless(None)
-                                    ));
+                            KeyCode::F3 => {
+                                if let Some(egui) = &mut self.egui_integration {
+                                    egui.toggle_ui();
                                 }
                             }
+                            KeyCode::F11 => {
+                                if let Some(window) = &self.window {
+                                    let is_fullscreen = window.fullscreen().is_some();
+                                    if is_fullscreen {
+                                        window.set_fullscreen(None);
+                                    } else {
+                                        window.set_fullscreen(Some(
+                                            winit::window::Fullscreen::Borderless(None)
+                                        ));
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
+                    } else {
+                        // Always remove on release to avoid stuck movement if egui consumed
+                        // the press side of the event.
+                        self.keys_pressed.remove(&keycode);
                     }
                 }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let scroll_amount = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y * 0.1,
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.y as f32) * 0.01,
+                };
+                
+                let mut camera = self.world.resource_mut::<CameraController>();
+                camera.fov = (camera.fov - scroll_amount).clamp(10.0_f32.to_radians(), 120.0_f32.to_radians());
             }
             WindowEvent::Resized(new_size) => {
                 if new_size.width == 0 || new_size.height == 0 {
@@ -351,6 +537,7 @@ impl ApplicationHandler for App {
             }
             _ => {}
         }
+
     }
     
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
@@ -373,20 +560,16 @@ impl App {
         // Run ECS systems
         self.schedule.run(&mut self.world);
         
-        // Get rotation from ECS
-        let rotation = self.get_cube_rotation();
+        // Update camera from input
+        self.update_camera();
         
         let renderer = match &mut self.renderer {
             Some(r) => r,
             None => return,
         };
         
-        let cube = match &mut self.cube_renderer {
-            Some(c) => c,
-            None => return,
-        };
-        
         let window_size = self.window.as_ref().map(|w| w.inner_size());
+        let aspect_ratio = renderer.swapchain_extent.width as f32 / renderer.swapchain_extent.height as f32;
         
         unsafe {
             // Wait for previous frame with timeout to prevent indefinite blocking
@@ -420,7 +603,17 @@ impl App {
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                     // Recreate swapchain
                     if let Some(size) = window_size {
-                        let _ = renderer.recreate_swapchain(size.width, size.height);
+                        if let Err(e) = renderer.recreate_swapchain(size.width, size.height) {
+                            eprintln!("Swapchain recreate failed: {:?}", e);
+                            return;
+                        }
+                        // Also recreate gltf renderer's swapchain resources
+                        if let Some(gltf) = &mut self.gltf_renderer {
+                            if let Err(e) = gltf.recreate_swapchain_resources(renderer) {
+                                eprintln!("glTF swapchain resource recreate failed: {}", e);
+                                return;
+                            }
+                        }
                     }
                     return;
                 }
@@ -429,6 +622,23 @@ impl App {
                     return;
                 }
             };
+            
+            // Wait for any previous frame that is using this swapchain image.
+            // With IMMEDIATE present mode the swapchain can return the same image index again
+            // before the GPU is finished with it.
+            let image_fence = renderer.images_in_flight[image_index as usize];
+            if image_fence != vk::Fence::null() {
+                if let Err(e) = renderer
+                    .device
+                    .wait_for_fences(&[image_fence], true, timeout)
+                {
+                    eprintln!("Fence wait for image_in_flight failed: {:?}", e);
+                    return;
+                }
+            }
+
+            // Mark this image as being used by the current frame's fence
+            renderer.images_in_flight[image_index as usize] = renderer.in_flight_fences[renderer.current_frame];
             
             renderer.device.reset_fences(
                 &[renderer.in_flight_fences[renderer.current_frame]],
@@ -441,49 +651,53 @@ impl App {
                 &begin_info,
             ).unwrap();
             
-            // Update uniform buffer with rotation FROM ECS
-            if let Err(e) = cube.update_uniform_buffer(renderer, renderer.current_frame, rotation) {
-                eprintln!("Failed to update uniform buffer: {}", e);
-                return;
+            // Get camera controller
+            let (camera_pos, camera_yaw, camera_pitch, camera_fov) = {
+                let camera = self.world.resource::<CameraController>();
+                (camera.position, camera.yaw, camera.pitch, camera.fov)
+            };
+            
+            // Get object scales
+            let gltf_scale = {
+                let objects = self.world.resource::<SceneObjects>();
+                objects.gltf_scale
+            };
+            
+            // Draw glTF model with its own pipeline and depth buffer
+            if let Some(gltf_renderer) = &self.gltf_renderer {
+                // Update uniform buffer
+                if let Err(e) = gltf_renderer.update_uniform_buffer(
+                    renderer.current_frame,
+                    glam::Vec3::ZERO,
+                    camera_pos,
+                    camera_yaw,
+                    camera_pitch,
+                    camera_fov,
+                    gltf_scale,
+                    aspect_ratio,
+                ) {
+                    eprintln!("Failed to update glTF uniform buffer: {}", e);
+                }
+                
+                // Render glTF (this starts its own render pass with depth)
+                gltf_renderer.render(
+                    &renderer.device,
+                    renderer.command_buffers[renderer.current_frame],
+                    renderer.swapchain_extent,
+                    image_index,
+                    renderer.current_frame,
+                );
+                
+                // End glTF render pass
+                gltf_renderer.end_render_pass(&renderer.device, renderer.command_buffers[renderer.current_frame]);
             }
             
-            // Begin render pass
-            let clear_values = [vk::ClearValue {
-                color: vk::ClearColorValue {
-                    float32: [0.53, 0.81, 0.92, 1.0],  // Sky blue
-                },
-            }];
-            
-            let render_pass_info = vk::RenderPassBeginInfo::default()
-                .render_pass(renderer.render_pass)
-                .framebuffer(renderer.framebuffers[image_index as usize])
-                .render_area(vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent: renderer.swapchain_extent,
-                })
-                .clear_values(&clear_values);
-            
-            renderer.device.cmd_begin_render_pass(
-                renderer.command_buffers[renderer.current_frame],
-                &render_pass_info,
-                vk::SubpassContents::INLINE,
-            );
-            
-            // Draw cube
-            if let Err(e) = cube.draw(renderer, renderer.command_buffers[renderer.current_frame], renderer.current_frame) {
-                eprintln!("Failed to draw cube: {:?}", e);
-                renderer.device.cmd_end_render_pass(renderer.command_buffers[renderer.current_frame]);
-                return;
-            }
-            
-            // Render egui
+            // Render egui (in the old render pass for overlays)
             if let (Some(egui_int), Some(egui_vk), Some(window)) = 
                 (&mut self.egui_integration, &mut self.egui_vulkan, &self.window) 
             {
                 // Skip egui entirely if UI is hidden for max FPS
-                if !egui_int.ui_visible {
-                    renderer.device.cmd_end_render_pass(renderer.command_buffers[renderer.current_frame]);
-                } else {
+                if egui_int.ui_visible {
                     // Get stats before querying
                     let (fps, frame_time_ms) = {
                         let stats = self.world.resource::<PerformanceStats>();
@@ -499,6 +713,11 @@ impl App {
                         renderables: self.world.query::<&Renderable>().iter(&self.world).count(),
                     };
                     
+                    let current_gltf_scale = {
+                        let objects = self.world.resource::<SceneObjects>();
+                        objects.gltf_scale
+                    };
+                    
                     let ui_data = UiData {
                         fps,
                         frame_time_ms,
@@ -506,16 +725,22 @@ impl App {
                         component_counts,
                         vulkan_version: renderer.vulkan_version.clone(),
                         gpu_name: renderer.gpu_name.clone(),
+                        cube_scale: 1.0, // No cube anymore
+                        gltf_scale: current_gltf_scale,
                     };
                     
-                    let full_output = egui_int.build_ui(window, &ui_data);
+                    let (full_output, scale_changed) = egui_int.build_ui(window, &ui_data);
+                    
+                    // Apply scale changes from UI
+                    if let Some((_, new_gltf_scale)) = scale_changed {
+                        let mut objects = self.world.resource_mut::<SceneObjects>();
+                        objects.gltf_scale = new_gltf_scale;
+                    }
 
-                    // Keep Vulkan font atlas in sync with egui (required for correct text on some machines/DPI settings)
+                    // Keep Vulkan font atlas in sync with egui
                     if !full_output.textures_delta.set.is_empty() {
-                        let timeout = 1_000_000_000; // 1 second
-                        if let Err(e) = renderer.device.wait_for_fences(&renderer.in_flight_fences, true, timeout) {
-                            eprintln!("Fence wait timeout during texture update: {:?}", e);
-                        }
+                        // Wait for device idle before updating textures
+                        let _ = renderer.device.device_wait_idle();
                     }
                     egui_vk.update_textures(
                         &renderer.device,
@@ -531,6 +756,26 @@ impl App {
                         full_output.pixels_per_point,
                     );
                     
+                    // Begin render pass for egui overlay
+                    let clear_values = [vk::ClearValue {
+                        color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 0.0] },
+                    }];
+                    
+                    let render_pass_info = vk::RenderPassBeginInfo::default()
+                        .render_pass(renderer.render_pass)
+                        .framebuffer(renderer.framebuffers[image_index as usize])
+                        .render_area(vk::Rect2D {
+                            offset: vk::Offset2D { x: 0, y: 0 },
+                            extent: renderer.swapchain_extent,
+                        })
+                        .clear_values(&clear_values);
+                    
+                    renderer.device.cmd_begin_render_pass(
+                        renderer.command_buffers[renderer.current_frame],
+                        &render_pass_info,
+                        vk::SubpassContents::INLINE,
+                    );
+                    
                     egui_vk.render(
                         &renderer.device,
                         renderer.command_buffers[renderer.current_frame],
@@ -540,11 +785,8 @@ impl App {
                         full_output.pixels_per_point,
                     );
                     
-                    // End render pass after egui
                     renderer.device.cmd_end_render_pass(renderer.command_buffers[renderer.current_frame]);
                 }
-            } else {
-                renderer.device.cmd_end_render_pass(renderer.command_buffers[renderer.current_frame]);
             }
             
             // End command buffer
@@ -593,7 +835,18 @@ impl App {
             
             if should_recreate {
                 if let Some(size) = window_size {
-                    let _ = renderer.recreate_swapchain(size.width, size.height);
+                    if let Err(e) = renderer.recreate_swapchain(size.width, size.height) {
+                        eprintln!("Swapchain recreate failed: {:?}", e);
+                        return;
+                    }
+
+                    // Recreate swapchain-dependent resources for custom renderers.
+                    if let Some(gltf) = &mut self.gltf_renderer {
+                        if let Err(e) = gltf.recreate_swapchain_resources(renderer) {
+                            eprintln!("glTF swapchain resource recreate failed: {}", e);
+                            return;
+                        }
+                    }
                 }
             }
             
@@ -618,8 +871,8 @@ impl App {
                     egui_vk.cleanup(&renderer.device);
                 }
                 
-                if let Some(cube) = &mut self.cube_renderer {
-                    cube.cleanup(renderer);
+                if let Some(gltf_renderer) = &mut self.gltf_renderer {
+                    gltf_renderer.cleanup(renderer);
                 }
             }
         }
@@ -629,6 +882,14 @@ impl App {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Set up panic hook to show stack trace
+    std::panic::set_hook(Box::new(|panic_info| {
+        eprintln!("PANIC: {}", panic_info);
+        if let Some(location) = panic_info.location() {
+            eprintln!("  at {}:{}:{}", location.file(), location.line(), location.column());
+        }
+    }));
+    
     let event_loop = EventLoop::new()?;
     let mut app = App::new();
     event_loop.run_app(&mut app)?;
