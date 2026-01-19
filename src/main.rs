@@ -116,10 +116,18 @@ pub struct CameraController {
 
 impl Default for CameraController {
     fn default() -> Self {
+        // Spawn camera already looking at the origin (where we place the duck)
+        // A slightly higher/farther view makes the ground plane visible.
+        let position = glam::Vec3::new(0.0, 2.5, 10.0);
+        let target = glam::Vec3::new(0.0, 0.6, 0.0);
+        let dir = (target - position).normalize_or_zero();
+        let yaw = dir.z.atan2(dir.x);
+        let pitch = dir.y.asin().clamp(-89.0_f32.to_radians(), 89.0_f32.to_radians());
+
         Self {
-            position: glam::Vec3::new(3.0, 2.0, 5.0),
-            yaw: 0.0,
-            pitch: 0.0,
+            position,
+            yaw,
+            pitch,
             fov: 45.0_f32.to_radians(),
             move_speed: 5.0,
             rotate_speed: 3.0, // Fast enough for comfortable 360° rotation
@@ -130,15 +138,15 @@ impl Default for CameraController {
 
 #[derive(Resource)]
 pub struct SceneObjects {
-    pub cube_scale: f32,
     pub gltf_scale: f32,
+    pub gltf_min_y: f32,
 }
 
 impl Default for SceneObjects {
     fn default() -> Self {
         Self {
-            cube_scale: 1.0,
-            gltf_scale: 0.3, // Duck is too big, start with smaller scale
+            gltf_scale: 0.01,
+            gltf_min_y: 0.0,
         }
     }
 }
@@ -150,18 +158,8 @@ impl Default for SceneObjects {
 fn setup_scene(mut commands: Commands) {
     println!("🎬 Setting up scene with Bevy ECS...");
     commands.spawn((Camera::default(), Transform::new()));
-    
-    // Spawn spinning cube offset to the left
-    let mut cube_transform = Transform::new();
-    cube_transform.position = glam::Vec3::new(-2.0, 0.0, 0.0);
-    
-    commands.spawn((
-        SpinningCube,
-        Renderable,
-        cube_transform,
-        Velocity { linear: glam::Vec3::ZERO, angular: glam::Vec3::new(0.0, 1.0, 0.0) },
-    ));
-    println!("✓ Scene setup complete - 1 camera, 1 spinning cube");
+
+    println!("✓ Scene setup complete - 1 camera");
 }
 
 fn rotation_system(timing: Res<FrameTiming>, mut query: Query<(&mut Transform, &Velocity)>) {
@@ -376,6 +374,11 @@ impl ApplicationHandler for App {
                             println!("📦 Loading glTF scene from: {}", path);
                             match GltfScene::load(path) {
                                 Ok(scene) => {
+                                    // Store model bounds so we can place it on the ground plane.
+                                    {
+                                        let mut objects = self.world.resource_mut::<SceneObjects>();
+                                        objects.gltf_min_y = scene.bounds_min[1];
+                                    }
                                     match GltfRenderer::new(&renderer, &scene) {
                                         Ok(gltf_renderer) => {
                                             println!("  ✓ glTF renderer created with textures");
@@ -658,17 +661,21 @@ impl App {
             };
             
             // Get object scales
-            let gltf_scale = {
+            let (gltf_scale, gltf_min_y) = {
                 let objects = self.world.resource::<SceneObjects>();
-                objects.gltf_scale
+                (objects.gltf_scale, objects.gltf_min_y)
             };
+
+            // Put the duck on the ground plane (Y=0). Account for user scale.
+            let duck_pos = glam::Vec3::new(0.0, -gltf_min_y * gltf_scale, 0.0);
+            let duck_pos = duck_pos + glam::Vec3::new(0.0, 0.001, 0.0);
             
             // Draw glTF model with its own pipeline and depth buffer
-            if let Some(gltf_renderer) = &self.gltf_renderer {
+            if let Some(gltf_renderer) = &mut self.gltf_renderer {
                 // Update uniform buffer
                 if let Err(e) = gltf_renderer.update_uniform_buffer(
                     renderer.current_frame,
-                    glam::Vec3::ZERO,
+                    duck_pos,
                     camera_pos,
                     camera_yaw,
                     camera_pitch,
@@ -725,7 +732,6 @@ impl App {
                         component_counts,
                         vulkan_version: renderer.vulkan_version.clone(),
                         gpu_name: renderer.gpu_name.clone(),
-                        cube_scale: 1.0, // No cube anymore
                         gltf_scale: current_gltf_scale,
                     };
                     

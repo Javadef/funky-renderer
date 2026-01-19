@@ -10,19 +10,23 @@ layout(location = 1) out vec3 fragNormal;
 layout(location = 2) out vec2 fragTexCoord;
 
 layout(binding = 0) uniform UniformBufferObject {
-    mat4 model;
     mat4 view;
     mat4 proj;
     vec4 cameraPos;
     vec4 lightDir;
 } ubo;
 
+layout(push_constant) uniform PushConstants {
+    mat4 model;
+    int useTexture;
+} pc;
+
 void main() {
-    vec4 worldPos = ubo.model * vec4(inPosition, 1.0);
+    vec4 worldPos = pc.model * vec4(inPosition, 1.0);
     gl_Position = ubo.proj * ubo.view * worldPos;
     
     // Transform normal to world space (assumes uniform scale)
-    mat3 normalMatrix = mat3(ubo.model);
+    mat3 normalMatrix = mat3(pc.model);
     fragNormal = normalize(normalMatrix * inNormal);
     
     fragColor = inColor;

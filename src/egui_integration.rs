@@ -67,7 +67,6 @@ pub struct UiData {
     pub component_counts: ComponentCounts,
     pub vulkan_version: String,
     pub gpu_name: String,
-    pub cube_scale: f32,
     pub gltf_scale: f32,
 }
 
@@ -105,7 +104,7 @@ fn render_debug_ui(ctx: &egui::Context, data: &UiData) -> Option<(f32, f32)> {
             let mut gltf_scale = data.gltf_scale;
             
             ui.label("Duck Scale:");
-            if ui.add(egui::Slider::new(&mut gltf_scale, 0.01..=2.0).text("scale")).changed() {
+            if ui.add(egui::Slider::new(&mut gltf_scale, 0.001..=0.5).text("scale").logarithmic(true)).changed() {
                 scale_changed = Some((1.0, gltf_scale));
             }
             

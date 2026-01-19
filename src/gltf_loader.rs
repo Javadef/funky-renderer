@@ -48,6 +48,9 @@ pub struct GltfScene {
     pub meshes: Vec<GltfMesh>,
     pub materials: Vec<GltfMaterial>,
     pub textures: Vec<GltfTexture>,
+    /// Axis-aligned bounds (model space) across all mesh vertex positions.
+    pub bounds_min: [f32; 3],
+    pub bounds_max: [f32; 3],
 }
 
 impl GltfScene {
@@ -151,6 +154,9 @@ impl GltfScene {
         
         // Load meshes
         let mut meshes = Vec::new();
+
+        let mut bounds_min = [f32::INFINITY, f32::INFINITY, f32::INFINITY];
+        let mut bounds_max = [f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
         
         for mesh in gltf.meshes() {
             for primitive in mesh.primitives() {
@@ -161,6 +167,16 @@ impl GltfScene {
                     .read_positions()
                     .map(|iter| iter.collect())
                     .unwrap_or_default();
+
+                // Update bounds
+                for p in &positions {
+                    bounds_min[0] = bounds_min[0].min(p[0]);
+                    bounds_min[1] = bounds_min[1].min(p[1]);
+                    bounds_min[2] = bounds_min[2].min(p[2]);
+                    bounds_max[0] = bounds_max[0].max(p[0]);
+                    bounds_max[1] = bounds_max[1].max(p[1]);
+                    bounds_max[2] = bounds_max[2].max(p[2]);
+                }
                 
                 // Read normals
                 let normals: Vec<[f32; 3]> = reader
@@ -215,6 +231,18 @@ impl GltfScene {
         println!("  ✓ Loaded {} meshes, {} materials, {} textures", 
                  meshes.len(), materials.len(), textures.len());
         
-        Ok(GltfScene { meshes, materials, textures })
+        // If the model had no positions, provide safe defaults.
+        if !bounds_min[0].is_finite() {
+            bounds_min = [0.0, 0.0, 0.0];
+            bounds_max = [0.0, 0.0, 0.0];
+        }
+
+        Ok(GltfScene {
+            meshes,
+            materials,
+            textures,
+            bounds_min,
+            bounds_max,
+        })
     }
 }

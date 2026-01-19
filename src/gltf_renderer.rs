@@ -1,9 +1,10 @@
 use ash::vk;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 use gpu_allocator::MemoryLocation;
-use crate::renderer::{VulkanRenderer, UniformBufferObject, MAX_FRAMES_IN_FLIGHT};
+use crate::renderer::{VulkanRenderer, MAX_FRAMES_IN_FLIGHT};
 use crate::gltf_loader::GltfScene;
 use std::ffi::CString;
+use glam::{Mat4, Quat, Vec3};
 
 // Vertex format for glTF with tex coords
 #[repr(C)]
@@ -17,6 +18,7 @@ pub struct GltfVertex {
 
 pub struct GltfRenderer {
     pub meshes: Vec<GltfMeshBuffers>,
+    pub ground: Option<GltfMeshBuffers>,
     pub texture: Option<TextureResources>,
     pub pipeline: vk::Pipeline,
     pub pipeline_layout: vk::PipelineLayout,
@@ -30,6 +32,27 @@ pub struct GltfRenderer {
     pub depth_allocations: Vec<Option<Allocation>>,
     pub render_pass: vk::RenderPass,
     pub framebuffers: Vec<vk::Framebuffer>,
+
+    pub ground_model: Mat4,
+    pub duck_model: Mat4,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GltfPushConstants {
+    pub model: [[f32; 4]; 4],
+    pub use_texture: i32,
+    pub _pad: [i32; 3],
+}
+
+// Must match shaders/gltf.vert + shaders/gltf.frag
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GltfUniformBufferObject {
+    pub view: [[f32; 4]; 4],
+    pub proj: [[f32; 4]; 4],
+    pub camera_pos: [f32; 4],
+    pub light_dir: [f32; 4],
 }
 
 pub struct GltfMeshBuffers {
@@ -113,8 +136,14 @@ impl GltfRenderer {
         let descriptor_set_layout = renderer.device.create_descriptor_set_layout(&layout_info, None)?;
         
         // Create pipeline layout
+        let push_constant_range = vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+            .offset(0)
+            .size(std::mem::size_of::<GltfPushConstants>() as u32);
+
         let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(std::slice::from_ref(&descriptor_set_layout));
+            .set_layouts(std::slice::from_ref(&descriptor_set_layout))
+            .push_constant_ranges(std::slice::from_ref(&push_constant_range));
         let pipeline_layout = renderer.device.create_pipeline_layout(&pipeline_layout_info, None)?;
         
         // Create pipeline
@@ -140,7 +169,7 @@ impl GltfRenderer {
         // Create uniform buffers and descriptor sets
         let mut uniform_buffers = Vec::new();
         let mut uniform_allocations = Vec::new();
-        let ubo_size = std::mem::size_of::<UniformBufferObject>() as u64;
+        let ubo_size = std::mem::size_of::<GltfUniformBufferObject>() as u64;
         
         let layouts = vec![descriptor_set_layout; MAX_FRAMES_IN_FLIGHT];
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
@@ -292,9 +321,13 @@ impl GltfRenderer {
                 index_count: indices.len() as u32,
             });
         }
+
+        // Create a simple ground plane
+        let ground = Some(Self::create_ground_plane(renderer)?);
         
         Ok(Self {
             meshes,
+            ground,
             texture,
             pipeline,
             pipeline_layout,
@@ -308,6 +341,79 @@ impl GltfRenderer {
             depth_allocations,
             render_pass,
             framebuffers,
+
+            ground_model: Mat4::IDENTITY,
+            duck_model: Mat4::IDENTITY,
+        })
+    }
+
+    unsafe fn create_ground_plane(
+        renderer: &VulkanRenderer,
+    ) -> Result<GltfMeshBuffers, Box<dyn std::error::Error>> {
+        // Two triangles, centered at origin on Y=0
+        let size = 20.0_f32;
+        let half = size * 0.5;
+
+        let color = [0.35, 0.35, 0.35];
+        let up = [0.0, 1.0, 0.0];
+
+        let vertices = vec![
+            GltfVertex { pos: [-half, 0.0, -half], color, normal: up, tex_coord: [0.0, 0.0] },
+            GltfVertex { pos: [ half, 0.0, -half], color, normal: up, tex_coord: [10.0, 0.0] },
+            GltfVertex { pos: [ half, 0.0,  half], color, normal: up, tex_coord: [10.0, 10.0] },
+            GltfVertex { pos: [-half, 0.0,  half], color, normal: up, tex_coord: [0.0, 10.0] },
+        ];
+
+        let indices: Vec<u32> = vec![0, 1, 2, 2, 3, 0];
+
+        // Vertex buffer
+        let vertex_buffer_size = (std::mem::size_of::<GltfVertex>() * vertices.len()) as u64;
+        let vertex_buffer_info = vk::BufferCreateInfo::default()
+            .size(vertex_buffer_size)
+            .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let vertex_buffer = renderer.device.create_buffer(&vertex_buffer_info, None)?;
+        let vertex_requirements = renderer.device.get_buffer_memory_requirements(vertex_buffer);
+        let vertex_allocation = renderer.allocator.lock().allocate(&AllocationCreateDesc {
+            name: "ground_vertex_buffer",
+            requirements: vertex_requirements,
+            location: MemoryLocation::CpuToGpu,
+            linear: true,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })?;
+        renderer
+            .device
+            .bind_buffer_memory(vertex_buffer, vertex_allocation.memory(), vertex_allocation.offset())?;
+        let vertex_data_ptr = vertex_allocation.mapped_ptr().unwrap().as_ptr() as *mut GltfVertex;
+        std::ptr::copy_nonoverlapping(vertices.as_ptr(), vertex_data_ptr, vertices.len());
+
+        // Index buffer
+        let index_buffer_size = (std::mem::size_of::<u32>() * indices.len()) as u64;
+        let index_buffer_info = vk::BufferCreateInfo::default()
+            .size(index_buffer_size)
+            .usage(vk::BufferUsageFlags::INDEX_BUFFER)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let index_buffer = renderer.device.create_buffer(&index_buffer_info, None)?;
+        let index_requirements = renderer.device.get_buffer_memory_requirements(index_buffer);
+        let index_allocation = renderer.allocator.lock().allocate(&AllocationCreateDesc {
+            name: "ground_index_buffer",
+            requirements: index_requirements,
+            location: MemoryLocation::CpuToGpu,
+            linear: true,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })?;
+        renderer
+            .device
+            .bind_buffer_memory(index_buffer, index_allocation.memory(), index_allocation.offset())?;
+        let index_data_ptr = index_allocation.mapped_ptr().unwrap().as_ptr() as *mut u32;
+        std::ptr::copy_nonoverlapping(indices.as_ptr(), index_data_ptr, indices.len());
+
+        Ok(GltfMeshBuffers {
+            vertex_buffer,
+            vertex_allocation: Some(vertex_allocation),
+            index_buffer,
+            index_allocation: Some(index_allocation),
+            index_count: indices.len() as u32,
         })
     }
     
@@ -840,7 +946,7 @@ impl GltfRenderer {
     }
     
     pub unsafe fn update_uniform_buffer(
-        &self,
+        &mut self,
         current_frame: usize,
         position: glam::Vec3,
         camera_pos: glam::Vec3,
@@ -858,9 +964,13 @@ impl GltfRenderer {
         ).normalize();
         
         let target = camera_pos + camera_front;
+
+        // Per-object transforms (sent via push constants)
+        self.ground_model = Mat4::IDENTITY;
         
-        let model = glam::Mat4::from_translation(position)
-            * glam::Mat4::from_scale(glam::Vec3::splat(scale));
+        // Rotate duck to face the camera (180 degrees around Y axis)
+        let duck_rotation = Quat::from_rotation_y(std::f32::consts::PI);
+        self.duck_model = Mat4::from_scale_rotation_translation(Vec3::splat(scale), duck_rotation, position);
         
         let view = glam::Mat4::look_at_rh(camera_pos, target, glam::Vec3::Y);
 
@@ -869,16 +979,18 @@ impl GltfRenderer {
         let mut proj = glam::Mat4::perspective_rh(camera_fov, aspect_ratio, 0.1, 100.0);
         proj.y_axis.y *= -1.0;
         
-        let ubo = UniformBufferObject {
-            model,
-            view,
-            proj,
-            camera_pos: glam::Vec4::new(camera_pos.x, camera_pos.y, camera_pos.z, 0.0),
-            light_dir: glam::Vec4::new(0.5, 1.0, 0.3, 0.0).normalize(),
+        let ubo = GltfUniformBufferObject {
+            view: view.to_cols_array_2d(),
+            proj: proj.to_cols_array_2d(),
+            camera_pos: [camera_pos.x, camera_pos.y, camera_pos.z, 0.0],
+            light_dir: {
+                let l = glam::Vec4::new(0.5, 1.0, 0.3, 0.0).normalize();
+                [l.x, l.y, l.z, l.w]
+            },
         };
         
         if let Some(allocation) = &self.uniform_allocations[current_frame] {
-            let ptr = allocation.mapped_ptr().unwrap().as_ptr() as *mut UniformBufferObject;
+            let ptr = allocation.mapped_ptr().unwrap().as_ptr() as *mut GltfUniformBufferObject;
             std::ptr::copy_nonoverlapping(&ubo, ptr, 1);
         }
         
@@ -943,8 +1055,42 @@ impl GltfRenderer {
             &[self.descriptor_sets[current_frame]],
             &[],
         );
+
+        unsafe fn push_model(
+            device: &ash::Device,
+            command_buffer: vk::CommandBuffer,
+            pipeline_layout: vk::PipelineLayout,
+            model: &Mat4,
+            use_texture: bool,
+        ) {
+            let pc = GltfPushConstants {
+                model: model.to_cols_array_2d(),
+                use_texture: if use_texture { 1 } else { 0 },
+                _pad: [0; 3],
+            };
+            let bytes = std::slice::from_raw_parts(
+                (&pc as *const GltfPushConstants) as *const u8,
+                std::mem::size_of::<GltfPushConstants>(),
+            );
+            device.cmd_push_constants(
+                command_buffer,
+                pipeline_layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                bytes,
+            );
+        }
+
+        // Draw ground
+        if let Some(ground) = &self.ground {
+            push_model(device, command_buffer, self.pipeline_layout, &self.ground_model, false);
+            device.cmd_bind_vertex_buffers(command_buffer, 0, &[ground.vertex_buffer], &[0]);
+            device.cmd_bind_index_buffer(command_buffer, ground.index_buffer, 0, vk::IndexType::UINT32);
+            device.cmd_draw_indexed(command_buffer, ground.index_count, 1, 0, 0, 0);
+        }
         
-        // Draw all meshes
+        // Draw duck meshes
+        push_model(device, command_buffer, self.pipeline_layout, &self.duck_model, true);
         for mesh in &self.meshes {
             device.cmd_bind_vertex_buffers(command_buffer, 0, &[mesh.vertex_buffer], &[0]);
             device.cmd_bind_index_buffer(command_buffer, mesh.index_buffer, 0, vk::IndexType::UINT32);
@@ -957,6 +1103,19 @@ impl GltfRenderer {
     }
     
     pub unsafe fn cleanup(&mut self, renderer: &VulkanRenderer) {
+        // Cleanup ground
+        if let Some(mut ground) = self.ground.take() {
+            renderer.device.destroy_buffer(ground.vertex_buffer, None);
+            if let Some(allocation) = ground.vertex_allocation.take() {
+                let _ = renderer.allocator.lock().free(allocation);
+            }
+
+            renderer.device.destroy_buffer(ground.index_buffer, None);
+            if let Some(allocation) = ground.index_allocation.take() {
+                let _ = renderer.allocator.lock().free(allocation);
+            }
+        }
+
         // Cleanup meshes
         for mesh in &mut self.meshes {
             renderer.device.destroy_buffer(mesh.vertex_buffer, None);
